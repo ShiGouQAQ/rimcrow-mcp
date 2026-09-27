@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "rimcrow_version": "0.24.7",
-  "captured_at": "2026-09-27T17:56:47.419087+00:00",
+  "captured_at": "2026-09-27T18:15:27.224361+00:00",
   "server_name": "rimcrow-mcp",
   "instructions": "RimCrow（RimWorld 模组管理器）的外部接口。工具按风险分级：[只读] 查询、[写] 修改状态、[高风险] 影响磁盘或作用域。使用纪律：\n1. 查要小页——先用 list_mods / get_load_order / read_logs 的 limit+offset（或 filter/keyword）定向取数，禁止无 limit 拉全量；响应信封里的 next_offset 用于翻页。\n2. 变要增量——加载顺序变更一律走 apply_load_order_ops，先 dry_run:true 预演再落盘；禁止「读全量→改→传全量」的调用链。\n3. token 续链——写加载顺序必须回传上一次响应的 version_token / new_version_token；冲突时按错误里的 nextActions 重取基线。\n4. 答要摘要——日志排查按 list_log_files → read_logs（levels 过滤、tail 尾读优先）→ get_log_context 逐级收敛，不要整文件回传。\n异步操作（scan_mods）完成后可用 wait_event 等待，或轮询 list_mods 确认。",
   "tools": [
