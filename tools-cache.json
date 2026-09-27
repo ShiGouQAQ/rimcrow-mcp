@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
   "rimcrow_version": "0.24.7",
-  "captured_at": "2026-09-27T18:15:27.224361+00:00",
+  "captured_at": "2026-09-27T19:38:30.184619+00:00",
   "server_name": "rimcrow-mcp",
-  "instructions": "RimCrow（RimWorld 模组管理器）的外部接口。工具按风险分级：[只读] 查询、[写] 修改状态、[高风险] 影响磁盘或作用域。使用纪律：\n1. 查要小页——先用 list_mods / get_load_order / read_logs 的 limit+offset（或 filter/keyword）定向取数，禁止无 limit 拉全量；响应信封里的 next_offset 用于翻页。\n2. 变要增量——加载顺序变更一律走 apply_load_order_ops，先 dry_run:true 预演再落盘；禁止「读全量→改→传全量」的调用链。\n3. token 续链——写加载顺序必须回传上一次响应的 version_token / new_version_token；冲突时按错误里的 nextActions 重取基线。\n4. 答要摘要——日志排查按 list_log_files → read_logs（levels 过滤、tail 尾读优先）→ get_log_context 逐级收敛，不要整文件回传。\n异步操作（scan_mods）完成后可用 wait_event 等待，或轮询 list_mods 确认。",
+  "instructions": "RimCrow（RimWorld 模组管理器）的外部接口。工具按风险分级：[只读] 查询、[写] 修改状态、[高风险] 影响磁盘或作用域。使用纪律：\n1. 查要小页——先用 list_mods / get_load_order / read_logs 的 limit+offset（或 filter/keyword）定向取数，禁止无 limit 拉全量；响应信封里的 next_offset 用于翻页。\n2. 变要增量——加载顺序变更一律走 apply_load_order_ops，先 dry_run:true 预演再落盘；禁止「读全量→改→传全量」的调用链。\n3. token 续链——写加载顺序必须回传上一次响应的 version_token / new_version_token；冲突时按错误里的 nextActions 重取基线。\n4. 答要摘要——日志排查按 list_log_files → read_logs（levels 过滤、tail 尾读优先）→ get_log_context 逐级收敛，不要整文件回传。\n5. 走闭环——获取：resolve_missing_dependencies → download_workshop_mods → wait_event(\"scan-complete\") → list_mods；排障：search_mod_text 在模组源码里取证，launch_game 后用 get_game_status / wait_event(\"game-status-changed\") 跟踪，再 read_logs 验证；整理：parse_load_order 解析 → apply_load_order_ops 落地。\n异步操作（scan_mods / 下载）完成后可用 wait_event 等待，或轮询 list_mods / get_download_tasks 确认。",
   "tools": [
     {
       "name": "get_initial_data",
@@ -1009,6 +1009,322 @@
       },
       "annotations": {
         "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "get_game_status",
+      "description": "[只读] 获取游戏运行状态与启动会话信息。\n返回 running(游戏进程是否在跑)、steam_running(Steam 客户端是否在跑)、\nruntime_session(最近一次启动会话的 id/状态/档案)。launch_game 之后用本工具\n或 wait_event(\"game-status-changed\") 跟踪启动结果。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "launch_game",
+      "description": "[写] 启动游戏(默认当前档案)。成本/副作用:会拉起 RimWorld 进程并可能同步\n运行时链接;请确认确实需要启动验证后再调用。\n后端检测到 Steam 冲突等启动前风险时不直接启动,而是返回需要确认的 warning:\n此时本工具以 isError 返回并在 nextActions 里给出处置指引,用 confirm_action\n重新调用即可继续(confirm_action 取值:continue=确认直启 / wait_steam_exit=\n等 Steam 退出 / retry_steam_client / retry_steam_url=换 Steam 方式重试 /\ncancel=取消启动)。启动已发起后用 get_game_status 跟踪。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "profile_id": {
+            "default": "",
+            "type": "string"
+          },
+          "confirm_action": {
+            "default": "",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "search_mod_text",
+      "description": "[只读] 在模组源码文件内容里做子串/正则搜索(ripgrep 语义),排障取证用:\n定位报错文本出自哪个模组哪个文件、某个 Def 字符串被谁定义等。\nscope: current-active=当前启用模组(默认,排障首选)、current-effective=当前生效\n(含补丁覆盖)、workshop/local/self=按库全量(慢);file_types 默认含 xml/json/cs。\n返回 matched_count 与按 mod_name/file_path/line_number/matched_line 组织的\nresults;max_results 截断时带 truncated 标记。本工具长等待(默认 120 秒)且与\nwait_event 共用单例事件队列:调用期间不要并发 wait_event,会互抢事件。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "scope": {
+            "default": "current-active",
+            "enum": [
+              "current-effective",
+              "current-active",
+              "workshop",
+              "local",
+              "self"
+            ],
+            "type": "string"
+          },
+          "use_regex": {
+            "default": false,
+            "type": "boolean"
+          },
+          "case_sensitive": {
+            "default": false,
+            "type": "boolean"
+          },
+          "max_results": {
+            "default": 50,
+            "type": "integer"
+          },
+          "timeout_seconds": {
+            "default": 120.0,
+            "type": "number"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "parse_load_order",
+      "description": "[只读] 解析一个排序文件或分享码,零写入:只返回解析结果与缺失项检查,\n不改动当前加载顺序。path 与 share_code 二选一(都传以 path 为准)。\n支持 ModsConfig.xml / ModList.xml / RML / RimSort 导出与分享码。\n返回 format/total/active_ids(供 apply_load_order_ops 落地用)/warnings/errors/\nimport_check(缺失模组清单与摘要)。落地请走 apply_load_order_ops。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "default": "",
+            "type": "string"
+          },
+          "share_code": {
+            "default": "",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "export_load_order",
+      "description": "[高风险] 把当前激活加载顺序导出为文件或分享码。\nexport_format=share_code 时直接返回 share_code 字符串,path 必须为空;\n其余格式(modsconfig/modlist/rml)必须给 path(完整目标文件路径,含扩展名),\n会写磁盘文件——请确认 path 正确后再调用。当前激活列表由服务端自读,不需要传。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "export_format": {
+            "enum": [
+              "modsconfig",
+              "modlist",
+              "rml",
+              "share_code"
+            ],
+            "type": "string"
+          },
+          "path": {
+            "default": "",
+            "type": "string"
+          },
+          "list_name": {
+            "default": "",
+            "type": "string"
+          }
+        },
+        "required": [
+          "export_format"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true
+      }
+    },
+    {
+      "name": "smart_insert_mods",
+      "description": "[写] 用规则引擎把给定模组智能插入当前激活列表并落盘(推荐的新模组入库入口)。\n插入位置由依赖/规则自动决定,agent 只需给出要插入的 package_ids(上限 100)。\nbase_version_token 来自 get_load_order 响应(过期即拒绝,同 apply_load_order_ops);\ndry_run:true 只返回插入锚点与摘要不落盘。成功响应含 applied 锚点(逐条\n{id,index,after})/auto_activated(联锁自动激活项)/new_version_token,不回传全表。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "package_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "base_version_token": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "package_ids",
+          "base_version_token"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "set_mod_absolute_position",
+      "description": "[写] 设置/清除某模组的用户固定位置规则(top=置顶,bottom=置底,none=清除),\n影响后续自动排序;写前可用 get_mod_rules 确认现状。comment 为可选备注。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "package_id": {
+            "type": "string"
+          },
+          "position": {
+            "enum": [
+              "top",
+              "bottom",
+              "none"
+            ],
+            "type": "string"
+          },
+          "comment": {
+            "default": "",
+            "type": "string"
+          }
+        },
+        "required": [
+          "package_id",
+          "position"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "get_residue_overview",
+      "description": "[只读] 读取当前扫描范围内的卸载残留目录与关联设置文件总览(纯读,不清理)。\n用于整理前评估哪些残留可以人工清理;清理动作属批量磁盘变更,不在工具面内。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "trace_install_sources",
+      "description": "[只读] 按 package_id 批量查询原始安装来源与替代安装来源(外置数据库本地查询)。\n返回 {package_id: {original: [...], replacement: [...]}} ,来源条目含\nworkshop_id/url/name/kind/supported_versions;查不到的 id 不在返回里。\n拿到 workshop_id 后可用 download_workshop_mods 补下载。上限 100 个 id。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "package_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "package_ids"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "resolve_missing_dependencies",
+      "description": "[只读] 检测启用列表(或给定 package_ids)缺失的前置依赖,并转换为可下载的\n工坊 ID 清单(本地规则+清单库为主,补名称时访问 Steam Web API,可能数秒)。\npackage_ids 缺省时服务端自读当前激活列表。返回 missing:\n[{workshop_id,name,preview_url}];直接可喂给 download_workshop_mods。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "package_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "download_workshop_mods",
+      "description": "[写] 用 SteamCMD 下载/更新指定工坊项,立即返回 task_id。\n成本/副作用:网络下载+写入工坊目录,下载成功后后端会自动触发一次全量扫描。\n进度用 get_download_tasks 轮询;入库确认等 wait_event(\"scan-complete\") 后\nlist_mods。SteamCMD 未就绪会报因果错误(先在 GUI 工具环境检查里修复)。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "workshop_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "workshop_ids"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "get_download_tasks",
+      "description": "[只读] 获取所有后台任务状态(SteamCMD 下载等),用于轮询下载进度与结果。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "check_mod_updates",
+      "description": "[只读] 检查已安装模组的可用更新(workshop 域走 Steamworks 本机状态,self 域走\nSteam Web API 在线时间比对)。返回 updates: [{workshop_id,title,source,\nlocal_time,online_time}]。访问网络,可能耗时十几秒;Steam 未运行时 workshop 域\n会被跳过(响应内注明),结果按实际覆盖面采信。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
         "destructiveHint": false
       }
     }
