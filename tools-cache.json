@@ -1,0 +1,1016 @@
+{
+  "schema_version": 1,
+  "rimcrow_version": "0.24.7",
+  "captured_at": "2026-09-27T17:56:47.419087+00:00",
+  "server_name": "rimcrow-mcp",
+  "instructions": "RimCrow（RimWorld 模组管理器）的外部接口。工具按风险分级：[只读] 查询、[写] 修改状态、[高风险] 影响磁盘或作用域。使用纪律：\n1. 查要小页——先用 list_mods / get_load_order / read_logs 的 limit+offset（或 filter/keyword）定向取数，禁止无 limit 拉全量；响应信封里的 next_offset 用于翻页。\n2. 变要增量——加载顺序变更一律走 apply_load_order_ops，先 dry_run:true 预演再落盘；禁止「读全量→改→传全量」的调用链。\n3. token 续链——写加载顺序必须回传上一次响应的 version_token / new_version_token；冲突时按错误里的 nextActions 重取基线。\n4. 答要摘要——日志排查按 list_log_files → read_logs（levels 过滤、tail 尾读优先）→ get_log_context 逐级收敛，不要整文件回传。\n异步操作（scan_mods）完成后可用 wait_event 等待，或轮询 list_mods 确认。",
+  "tools": [
+    {
+      "name": "get_initial_data",
+      "description": "[只读] 获取全量启动数据(设置/模组列表/分组/加载顺序等)。\n输出体积较大,首次了解项目状态时使用;之后请用 list_mods / get_load_order 等定向查询。\n超出单次输出上限时按字段从大到小逐个截断:每个大列表字段保留各自能容纳的最长前缀,\ntotal_items 给出各被截字段的原始条数,truncated_fields 列出被截字段;仅当标量本身\n超限才退化为只含字段名的截断壳。\n因此更推荐按需取数:list_mods / get_load_order / get_groups / get_settings_overview;\n本工具只适合数据量小的档案做一次性全量快照。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "list_mods",
+      "description": "[只读] 获取模组列表核心数据(all_mods)。扫描完成或状态变更后调用此方法刷新。\n（MCP 扩展）filter 按 name+packageId 子串匹配(大小写不敏感)；fields 投影字段；\nlimit/offset 分页(信封返回 total/items/next_offset)。不传 limit 时返回全量并由\n体积护栏按元素边界截断(hint 引导继续用 limit/offset/filter)。\n加载顺序用 get_load_order，分组用 get_groups。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "filter": {
+            "default": "",
+            "type": "string"
+          },
+          "fields": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "limit": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "offset": {
+            "default": 0,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "get_load_order",
+      "description": "[只读] 获取当前档案的加载顺序信息。\n（MCP 扩展）limit/offset 分页，响应信封含 version_token(写入前必须原样回传)；\nitems 为按加载顺序排列的 {package_id, name, workshop_id} 记录，fields 可投影，\n仅支持 package_id / name / workshop_id 三个字段（其它字段不支持，请勿传入）。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "filter": {
+            "default": "",
+            "type": "string"
+          },
+          "fields": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "limit": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "offset": {
+            "default": 0,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "list_backups",
+      "description": "[只读] 列出所有备份文件(可按 profile_id 过滤)。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "list_profiles",
+      "description": "[只读] 列出所有游戏档案(profile)。\n（MCP 扩展）默认不含 inactive_mods_order/temp_mods_order 整序数组（大载荷剥离，\n「查要小」纪律）；激活加载顺序请用 get_load_order。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "read_logs",
+      "description": "[只读] 分页读取系统日志(JSONL),适合错误排查与 AI 诊断。\n参数 log_type / filename 从 list_log_files 等来源获取,缺省按 active 档案。\n（MCP 扩展）levels 按级别过滤(如 [\"error\",\"warning\"])；since/until 时间范围\n(支持 \"1h\"/\"30m\" 相对量或 ISO 时间)；line_from/line_to 行号范围；keyword 子串；\ntail=N 只取最新的 N 条匹配(提前停止扫描)；默认即尾读(第 1 页为最新)。\n返回窗口由 limit / offset / tail 决定；page_size 只是内部扫描时每次向后端请求的\n页大小(默认 1000)，不决定返回条数，通常不需要传。\ntail 模式返回 paging:\"tail\" 且 next_offset 恒为 null（一次性取尾，不可翻页）。\n每条返回条目都带 raw_lines(该日志块对应的源日志行号列表,1 基)——它是\nget_log_context.target_line 的唯一合法来源(取 raw_lines[0])。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "log_type": {
+            "default": "game",
+            "type": "string"
+          },
+          "filename": {
+            "default": "",
+            "type": "string"
+          },
+          "levels": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "since": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "until": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "line_from": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "line_to": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "keyword": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "tail": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "limit": {
+            "default": 100,
+            "type": "integer"
+          },
+          "offset": {
+            "default": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "default": 1000,
+            "type": "integer"
+          },
+          "profile_scope": {
+            "default": "active",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "get_settings_overview",
+      "description": "[只读] 获取模组设置概览。\n单次返回当前档案的全量概览,体量很大(实测单次约 124KB)且没有分页/过滤参数,\n只在需要全貌时调用,取到后不要整包回传。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "get_groups",
+      "description": "[只读] 获取全部分组及其模组归属(含 group_id/name/color/sort_index/mod_ids)。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "wait_event",
+      "description": "[只读] 等待后端事件(如 \"scan-complete\")到达,超时返回 timeout 状态。\n等待开始时先丢弃队列中已积压的陈旧事件,单等待者场景下只有等待期间新到达的\n事件会命中;用于 scan_mods 等异步操作完成后的确认。\n（MCP 扩展）事件队列为单例：多个并发等待者会互相消费事件(另一等待者可能先取走\n你正在等的事件)；且只捕获内嵌端点就绪之后发出的事件——启动早期的事件请轮询\nlist_mods 确认，不要盲等。事件条目不带发生时间字段,命中后请核对 data 再采信。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "event_name": {
+            "type": "string"
+          },
+          "timeout": {
+            "default": 60.0,
+            "type": "number"
+          }
+        },
+        "required": [
+          "event_name"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "scan_mods",
+      "description": "[写] 触发后台模组扫描,立即返回已启动状态;\n完成后可用 wait_event(\"scan-complete\") 等待,或轮询 list_mods 确认结果。\nspecific_paths 为空时使用设置中的默认路径。\n成本/副作用:这是重 IO 的全库扫描(默认扫 DLC / 本地 Mods / 自身 Mods /\n工坊 Mods / 工具模组目录),扫描收尾还会同步 _Link_ 部署(增删运行时联接);\nforced_update=true 会强制刷新所有模组数据。请按需调用,不要连续触发。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "specific_paths": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "forced_update": {
+            "default": false,
+            "type": "boolean"
+          },
+          "size_check_override": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "size_check_paths": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "sort_mods",
+      "description": "[写] 对传入的激活模组 ID 列表执行自动排序,返回 sorted_ids / warnings。\n响应还可能含 auto_activated(排序时被自动激活的联锁项)。\n只计算顺序,不写 ModsConfig.xml;确认结果后用 apply_load_order_ops / save_load_order 落盘。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "active_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "active_ids"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "save_load_order",
+      "description": "[写] 保存激活列表到 ModsConfig.xml,带磁盘冲突保护(token 校验)。\nactive_ids 为完整的目标激活列表;base_version_token 在 schema 里可选(默认 null),\n但强烈建议传此前读取到的版本 token——不传会跳过磁盘冲突保护,可能覆盖外部改动。\n（MCP 扩展）⚠ 大载荷：这是全量回传形态,仅作兼容保留；顺序调整请优先用\napply_load_order_ops(增量、原子、带 dry_run)。本工具为既有调用方保留兼容,\n不设移除版本号;如确需移除,须先确认无调用方并另行公告。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "active_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "is_dirty": {
+            "default": true,
+            "type": "boolean"
+          },
+          "base_version_token": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "active_ids"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "update_mod_data",
+      "description": "[写] 更新某个模组的用户自定义数据(别名/标签/备注/颜色等),data_dict 为要合并写入的字段。\n合并语义:只覆盖 data_dict 里出现的字段,未出现的字段保持原值;字段名必须是用户数据\n模型字段(如 alias_name/notes/tags/sign_color),未知字段会被静默丢弃。\n可写字段可参照 get_mod_user_data 的返回确认现状。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "package_id": {
+            "type": "string"
+          },
+          "data_dict": {
+            "additionalProperties": true,
+            "type": "object"
+          }
+        },
+        "required": [
+          "package_id",
+          "data_dict"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "create_group",
+      "description": "[写] 创建模组分组,name 为分组名,color 为颜色(十六进制如 #FF0000)。\ncolor 必须是 #RRGGBB 形式的十六进制;非法值会被静默置为 #ffffff(不报错也不警告)。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "color": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "color"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "update_group",
+      "description": "[写] 更新分组属性(重命名/改色/折叠),updates 可含 name/color/is_expanded 字段。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "group_id": {
+            "type": "string"
+          },
+          "updates": {
+            "additionalProperties": true,
+            "type": "object"
+          }
+        },
+        "required": [
+          "group_id",
+          "updates"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "add_mods_to_group",
+      "description": "[写] 把模组 ID 列表加入指定分组(mod_ids 用 package_id)。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "group_id": {
+            "type": "string"
+          },
+          "mod_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "group_id",
+          "mod_ids"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "remove_mods_from_group",
+      "description": "[写] 从指定分组移除模组 ID 列表(mod_ids 用 package_id)。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "group_id": {
+            "type": "string"
+          },
+          "mod_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "group_id",
+          "mod_ids"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "reorder_group_content",
+      "description": "[写] 重排分组内模组的显示顺序,mod_id_list 为该分组完整的目标顺序。\n实际语义是「设置分组成员顺序」而非单纯重排:列表中的组外模组会被并入该分组\n(要求模组资产存在),列表必须非空且不得重复;未出现在列表里的原有成员不会被移除,\n会按原顺序续到列表末尾,传入列表的顺序成为结果的前缀。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "group_id": {
+            "type": "string"
+          },
+          "mod_id_list": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "group_id",
+          "mod_id_list"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "reorder_groups",
+      "description": "[写] 重排分组列表的显示顺序,group_id_list 为完整的目标顺序。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "group_id_list": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "group_id_list"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "create_backup",
+      "description": "[高风险] 把加载顺序备份为文件(ModsConfig.xml 风格)到指定目录。\n会写磁盘文件,请确认 target_dir 正确后再调用。\n实际是把既有备份文件复制到 target_dir:target_dir 必须是已存在的目录(否则报错),\n同名文件不会被覆盖(会自动加序号改名,如 name-1.xml),成功响应含新文件 path。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "target_dir": {
+            "type": "string"
+          },
+          "profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "path",
+          "target_dir"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true
+      }
+    },
+    {
+      "name": "activate_profile",
+      "description": "[高风险] 切换当前游戏档案(profile),会影响后续所有操作的作用域,\n切换后请用 list_mods / get_load_order 重新读取状态。\npid 取 list_profiles 返回条目的 id;切换是全局的,会改变此后所有调用读写的数据源。\n切换失败时后端会尝试回退到 default 档案,因此即使返回 error 当前档案也可能已经改变,\n请用 list_profiles 复核实际生效的档案。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "pid": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "pid"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true
+      }
+    },
+    {
+      "name": "delete_group",
+      "description": "[高风险] 删除指定分组(含其模组归属关系),不可恢复,请先 get_groups 确认 group_id。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "group_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "group_id"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true
+      }
+    },
+    {
+      "name": "get_log_context",
+      "description": "[只读] 读取某条错误摘要对应的详细日志上下文，包含原始报错内容与截断堆栈。仅当摘要不足以定位问题时再调用。\n（MCP 扩展）log_type: \"game\"|\"app\"；filename 缺省用日志源中最新文件(见 list_log_files)。\nstack_excerpt_lines 取值 6-80（越界上游参数模型会拒绝）。\ntarget_line 必须取 read_logs 返回条目的 raw_lines[0]（本工具自己的行号坐标系）；\n不要用 grep / 编辑器 / IDE 数出来的行号——日志可能含单独 CR 换行，外部工具的行号\n坐标系与本工具不一致（实测差 3 行会静默定位到无关内容）；它也不是 read_logs\n返回列表的序号。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "target_line": {
+            "type": "integer"
+          },
+          "stack_excerpt_lines": {
+            "default": 15,
+            "type": "integer"
+          },
+          "log_type": {
+            "default": "game",
+            "type": "string"
+          },
+          "filename": {
+            "default": "",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target_line"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "search_mods",
+      "description": "[只读] 按名称、别名、作者或 package_id 片段搜索可能对应的模组，用于确认准确 package_id。\nlimit 取值范围 1..50(默认 10，0 或 51 这类越界值会被参数模型拒绝)。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "keyword": {
+            "type": "string"
+          },
+          "limit": {
+            "default": 10,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "keyword"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "get_active_mod_list",
+      "description": "[只读] 获取当前环境中的启用模组列表，用于整体排序和冲突排查。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "include_names": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "get_mod_info",
+      "description": "[只读] 读取已安装模组的元数据。simple 返回基本信息：('package_id', 'name', 'workshop_id', 'supported_versions', 'is_active', 'path')；all 返回全部信息；specific 返回指定字段：('package_id', 'name', 'author', 'workshop_id', 'version', 'description', 'path', 'url', 'source', 'store', 'supported_versions', 'supported_languages', 'mod_type', 'is_active', 'dependencies_mods', 'load_after_mods', 'load_before_mods', 'incompatible_mods', 'save_breaking', 'last_active_time', 'last_moved_time')。\nscope=specific 必须提供非空且全部合法的 fields(合法值即上面 specific 列出的字段),\nfields 为空或含非法字段时整个调用会被拒绝,不会部分返回。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "package_id": {
+            "type": "string"
+          },
+          "scope": {
+            "default": "simple",
+            "enum": [
+              "simple",
+              "all",
+              "specific"
+            ],
+            "type": "string"
+          },
+          "fields": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "package_id"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "get_mod_rules",
+      "description": "[只读] 读取模组依赖、前置、后置和不兼容规则，用于判断显性排序和兼容关系。\n单模组一跳明细；多级依赖图/环路/影响面请用 get_mod_dependencies。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "package_id": {
+            "type": "string"
+          },
+          "native_only": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "package_id"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "get_mod_user_data",
+      "description": "[只读] 读取管理器中的模组别名、标签、备注、颜色、分组等用户态信息，仅用于辅助理解玩家归类。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "package_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "package_id"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "get_group_mods",
+      "description": "[只读] 按分组名读取分组下的模组列表，仅用于辅助理解玩家自己的分组归类。\ngroup_name 是子串模糊匹配(大小写不敏感)，可能同时命中多个分组，结果逐组放在\nmatched_groups 里；limit 为每组最多返回的模组数，取值 1..100(默认 40，越界会被\n参数模型拒绝)，截断时该组带 truncated 标记。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "group_name": {
+            "type": "string"
+          },
+          "limit": {
+            "default": 40,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "group_name"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "get_mod_dependencies",
+      "description": "[只读] 查询模组间的依赖/顺序关系图(参数名是驼峰 packageId，与其它工具的 package_id 不同)，支持多级展开与环路报告。\npackageId 起点；direction: up=声明指向我的边(谁依赖我/要求在我之后，删除前影响分析用)、\ndown=我声明的边(我依赖谁/要求谁在我之后)、both=双向；depth=1..5 展开层级；\nformat=edges 返回平铺边表 [{from,to,relation,depth}](默认，省 token、可截断)，\ntree 仅 depth<=2 允许(嵌套结构)。环路(loadBefore/After 互指)单独报 cycles，不死循环。\nedges 上限 500 条：响应 truncated:true 表示还有边没收齐；本工具没有续取参数，\n只能用 direction/depth 收窄范围后重新查询。\n单模组规则明细(含权重/来源/遮蔽)请用 get_mod_rules。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "packageId": {
+            "type": "string"
+          },
+          "direction": {
+            "default": "both",
+            "enum": [
+              "both",
+              "up",
+              "down"
+            ],
+            "type": "string"
+          },
+          "depth": {
+            "default": 1,
+            "type": "integer"
+          },
+          "format": {
+            "default": "edges",
+            "enum": [
+              "edges",
+              "tree"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "packageId"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "list_log_files",
+      "description": "[只读] 列出可读日志文件(name/path/size/mtime，按修改时间倒序)，\n是 read_logs / get_log_context 的 filename 来源；log_type: \"game\"|\"app\"。\nlog_type 不是枚举(schema 为 string)，只有 game / app 两个有效值，\n其它值(含空串)会静默按 game 处理。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "log_type": {
+            "default": "game",
+            "type": "string"
+          },
+          "profile_scope": {
+            "default": "active",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "apply_load_order_ops",
+      "description": "[写] 以增量操作原子地修改加载顺序（推荐的顺序变更入口）。\nops 逐条执行、整体全有全无：{\"op\":\"insert\",\"id\":X,\"anchor\":{after|before|index}}、\n{\"op\":\"remove\",\"ids\":[...]}, {\"op\":\"move\",\"id\":X,\"to\":{index|after|before}},、\n{\"op\":\"activate\",\"ids\":[...]}, {\"op\":\"deactivate\",\"ids\":[...]}（上限 100 条）。\nbase_version_token 来自 get_load_order 响应；dry_run:true 只校验不落盘。\n落盘成功(dry_run=false)的响应含 summary/conflicts/new_version_token，绝不回传全量列表；\ndry_run 的响应只有 summary/conflicts，不含 new_version_token(只有真正写盘才发新 token)。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "base_version_token": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "ops": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "base_version_token",
+          "ops"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "set_mod_rule",
+      "description": "[写] 增、改或删一条本模组的用户排序/冲突规则（AI 助手\"应用模组规则\"动作的同源能力）。\nrelation: loadAfter=本模组必须排在 target_id 之后(target 是前置)、loadBefore=必须排在\ntarget_id 之前、incompatibleWith=两者不应同时启用;remove:true 只删除指定的这一条关系,\n该模组其它既有规则一律保留(合并写入,非整包替换)。comment 为可选备注,显示在规则管理界面。\n内容无变化时返回 action=noop 不落盘;规则即时写盘并影响后续自动排序,建议写前用\nget_mod_rules(package_id) 确认现状。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "package_id": {
+            "type": "string"
+          },
+          "relation": {
+            "enum": [
+              "loadAfter",
+              "loadBefore",
+              "incompatibleWith"
+            ],
+            "type": "string"
+          },
+          "target_id": {
+            "type": "string"
+          },
+          "comment": {
+            "default": "",
+            "type": "string"
+          },
+          "remove": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "package_id",
+          "relation",
+          "target_id"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    }
+  ]
+}

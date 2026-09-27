@@ -1,0 +1,37 @@
+[package]
+name = "rimcrow-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "RimCrow MCP bridge: a thin stdio <-> Streamable HTTP bridge for RimCrow"
+license = "MIT"
+publish = false
+
+[dependencies]
+rmcp = { version = "3.4", default-features = false, features = [
+    "server",
+    "client",
+    "transport-io",
+    "transport-streamable-http-client-reqwest",
+] }
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "time",
+    "sync",
+    "process",
+    "io-std",
+    "io-util",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sysinfo = "0.37"
+chrono = "0.4"
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "unwind"
