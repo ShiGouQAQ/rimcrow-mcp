@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "rimcrow_version": "0.24.7",
-  "captured_at": "2026-09-28T03:52:03.251430+00:00",
+  "captured_at": "2026-09-28T06:22:07.259403+00:00",
   "server_name": "rimcrow-mcp",
   "instructions": "RimCrow（RimWorld 模组管理器）的 MCP 接口。工具按风险标注只读/写入/高风险（对应 MCP ToolAnnotations 的 readOnlyHint / destructiveHint）。使用约定：\n1. 分页取数——list_mods / get_load_order / read_logs 用 limit+offset（或 filter/keyword）限定范围，避免一次取回全部；响应里 next_offset 非 null 表示还有下一页。\n2. 增量修改——加载顺序一律用 apply_load_order_ops 提交 ops，先 dry_run:true 校验再正式写入；不要「读全量→改→回传全量」。\n3. 并发控制——写入必须带上最近一次响应的 version_token / new_version_token（乐观锁）；不一致会返回冲突，此时重新 get_load_order 取新 token 后重试。\n4. 返回摘要——日志按 list_log_files → read_logs（levels 过滤、tail 取最新）→ get_log_context 逐层缩小范围，不要回传整份文件。\n5. 按固定流程组合——获取依赖：resolve_missing_dependencies → download_workshop_mods → wait_event(\"scan-complete\") → list_mods；排障：search_mod_text 检索模组文件，launch_game 后用 get_game_status / wait_event(\"game-status-changed\") 跟踪再 read_logs 验证；导入排序：parse_load_order 解析 → apply_load_order_ops 写入；贴图转换：get_texture_encoder_status → download_texture_encoder（缺 bin 时）→ start_texture_convert（先 dry_run:true 预演）→ get_texture_convert_tasks 轮询。\nscan_mods、下载等异步操作完成后用 wait_event 等待，或轮询 list_mods / get_download_tasks 确认。",
   "tools": [
@@ -1476,14 +1476,15 @@
     },
     {
       "name": "download_texture_encoder",
-      "description": "[写] 下载缺失的贴图编码器可执行文件到工具目录,立即返回下载任务。\nbackend=todds → todds-encoder/todds release zip(解包);texconv →\nmicrosoft/DirectXTex release 单文件 exe(直落工具目录)。已就绪返回\nalready_ready:true 不重复下载。进度用 get_download_tasks 轮询,完成后用\nget_texture_encoder_status 复核。访问网络。",
+      "description": "[写] 准备缺失的贴图编码器。todds → release zip 解包;texconv → microsoft/DirectXTex\n单文件直落工具目录;nvtt → **不自动下载**(闭源安装包无稳定直链),返回官网地址由界面\n打开,安装后重新调用即可识别。已就绪返回 already_ready:true 不重复下载。\n进度用 get_download_tasks 轮询(todds/texconv),完成后用 get_texture_encoder_status 复核。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
           "backend": {
             "enum": [
               "todds",
-              "texconv"
+              "texconv",
+              "nvtt"
             ],
             "type": "string"
           }
@@ -1500,7 +1501,7 @@
     },
     {
       "name": "start_texture_convert",
-      "description": "[高风险] 把模组 Textures 目录下的 PNG 批量转为 DDS(原地写入,源 PNG 永不删除)。\nmod_paths 为模组根目录绝对路径(list_mods 条目的 path 字段,上限 50 个)。\nbackend=auto 按机器自动选:texconv 可用且无需缩放 → texconv 混合(GPU BC7 +\nCPU BC1,较 todds 快约 1.5 倍,质量低 2~4dB 基准判定肉眼不可分);否则 todds\n(质量与现管线等同)。需要缩放时 auto 落 todds(texconv 不支持缩放);质量零妥协\n显式传 backend=\"todds\"。output_format=zstd 生成 Image Opt Continued 可读的\n.dds.zstd。scale_factor 只接受 1.0(原尺寸,默认)或 GUI 缩放档位\n(20/25/40/50/60/75/80%),其它值(如 0.9)报因果错误——非档位值会被后端静默按原\n尺寸转换,所以不代为取整。overwrite=false 只补缺失输出(增量,推荐),true 全量\n重编;缩放档 overwrite=false 沿用 GUI 档位语义。gpu_workers/cpu_workers 覆盖\n自动并发(自动: gpu=3(实测探测失败→0)、cpu=clamp(逻辑核-2,2,6),取值 1..12),\n**仅 backend=texconv 生效**(todds 走自身内置线程池、默认跑满逻辑核,不接受这两个\n参数,也未暴露它的 -th/--threads)。\ndry_run:true 只扫描统计不写盘,返回 summary(沿用扫描层既有键:generate_required_count\n=待转换条数、source_total_count=源文件数、pending_source_bytes=待转写字节量)、\n逐模组 mods 与将选用的 backend。\n任务异步执行立即返回 task_id,用 get_texture_convert_tasks 轮询,\ncancel_texture_convert 可取消。\n成本/副作用:批量写入模组目录的 .dds/.dds.zstd(含工坊模组目录);请先 dry_run。",
+      "description": "[高风险] 把模组 Textures 目录下的 PNG 批量转为 DDS(原地写入,源 PNG 永不删除)。\nmod_paths 为模组根目录绝对路径(list_mods 条目的 path 字段,上限 50 个)。\nbackend 四选一(缺省 auto = 有 texconv 就用 texconv,否则 todds):\n  todds  = 标准档,画质最高(BC7 62.56 / BC1 42.50 dB),最慢;\n  nvtt   = 中等档,画质贴近标准(62.22 / 41.35,BC1 曾反超标准),原尺寸下速度居中;\n  texconv= 快速档,最快(1.51~1.82 倍),画质低 2~4 dB(肉眼难分)。\n**三档均支持缩放**:todds 用原生 -sc;nvtt/texconv 由包装层先做 PIL LANCZOS 预缩放\n再编码。**缩放会改变速度排名**:原尺寸 中等快于标准,50% 缩放后标准反超中等\n(实测 352 张:快速 15.3s / 标准 21.7s / 中等 35.3s,预缩放本身占 3.4s)。\n**nvtt 需本机已装 NVIDIA Texture Tools Exporter**,不自动下载——缺失时用\ndownload_texture_encoder(backend=\"nvtt\") 取官网地址,装好后重新调用即识别。\noutput_format=zstd 生成 Image Opt Continued 可读的 .dds.zstd。\nscale_factor 只接受 1.0(原尺寸,默认)或 GUI 缩放档位(20/25/40/50/60/75/80%),\n其它值(如 0.9)报因果错误——非档位值会被后端静默按原尺寸转换,所以不代为取整。\noverwrite=false 只补缺失输出(增量,推荐),true 全量重编;缩放档 overwrite=false\n沿用 GUI 档位语义。gpu_workers/cpu_workers 覆盖自动并发(1..12):对 texconv 决定\nGPU/CPU 分片(gpu 缺省 3、实测探测失败→0;cpu=clamp(逻辑核-2,2,6));对 nvtt 只决定\n分片数(缺省 6,8 即驱动排队劣化);todds 走内置线程池、不接受这两个参数。\ndry_run:true 只扫描统计不写盘,返回 summary(沿用扫描层既有键:generate_required_count\n=待转换条数、source_total_count=源文件数、pending_source_bytes=待转写字节量)、\n逐模组 mods 与将选用的 backend。\n任务异步执行立即返回 task_id,用 get_texture_convert_tasks 轮询,\ncancel_texture_convert 可取消。\n成本/副作用:批量写入模组目录的 .dds/.dds.zstd(含工坊模组目录);请先 dry_run。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -1514,8 +1515,9 @@
             "default": "auto",
             "enum": [
               "auto",
-              "texconv",
-              "todds"
+              "todds",
+              "nvtt",
+              "texconv"
             ],
             "type": "string"
           },
