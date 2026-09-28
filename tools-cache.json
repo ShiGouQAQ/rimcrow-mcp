@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "rimcrow_version": "0.24.7",
-  "captured_at": "2026-09-28T06:22:07.259403+00:00",
+  "captured_at": "2026-09-28T06:25:22.569969+00:00",
   "server_name": "rimcrow-mcp",
   "instructions": "RimCrow（RimWorld 模组管理器）的 MCP 接口。工具按风险标注只读/写入/高风险（对应 MCP ToolAnnotations 的 readOnlyHint / destructiveHint）。使用约定：\n1. 分页取数——list_mods / get_load_order / read_logs 用 limit+offset（或 filter/keyword）限定范围，避免一次取回全部；响应里 next_offset 非 null 表示还有下一页。\n2. 增量修改——加载顺序一律用 apply_load_order_ops 提交 ops，先 dry_run:true 校验再正式写入；不要「读全量→改→回传全量」。\n3. 并发控制——写入必须带上最近一次响应的 version_token / new_version_token（乐观锁）；不一致会返回冲突，此时重新 get_load_order 取新 token 后重试。\n4. 返回摘要——日志按 list_log_files → read_logs（levels 过滤、tail 取最新）→ get_log_context 逐层缩小范围，不要回传整份文件。\n5. 按固定流程组合——获取依赖：resolve_missing_dependencies → download_workshop_mods → wait_event(\"scan-complete\") → list_mods；排障：search_mod_text 检索模组文件，launch_game 后用 get_game_status / wait_event(\"game-status-changed\") 跟踪再 read_logs 验证；导入排序：parse_load_order 解析 → apply_load_order_ops 写入；贴图转换：get_texture_encoder_status → download_texture_encoder（缺 bin 时）→ start_texture_convert（先 dry_run:true 预演）→ get_texture_convert_tasks 轮询。\nscan_mods、下载等异步操作完成后用 wait_event 等待，或轮询 list_mods / get_download_tasks 确认。",
   "tools": [
