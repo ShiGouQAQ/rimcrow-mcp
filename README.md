@@ -16,7 +16,7 @@ endpoint 文件契约：`plan\SPEC-mcp-embed.md` §4.3（`schema_version=1`）�
 
 ```powershell
 cargo build --release        # 产物 target\release\rimcrow-mcp.exe（约 4.0 MB）
-cargo test                   # 47 个单测
+cargo test                   # 68 个单测
 
 # 冒烟五态唯一入口已收敛到 RimCrow 仓库（本目录不留重复件）：
 cd E:\Games\RimWorld\dev\RimCrow\.worktrees\feat-mcp-server

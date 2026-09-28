@@ -20,6 +20,7 @@ mod endpoint;
 mod envelope;
 mod snapshot;
 mod spawn;
+mod validate;
 
 use std::io::Write;
 use std::panic::AssertUnwindSafe;

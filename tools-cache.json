@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
   "rimcrow_version": "0.24.7",
-  "captured_at": "2026-09-27T19:38:30.184619+00:00",
+  "captured_at": "2026-09-28T02:51:51.091080+00:00",
   "server_name": "rimcrow-mcp",
-  "instructions": "RimCrow（RimWorld 模组管理器）的外部接口。工具按风险分级：[只读] 查询、[写] 修改状态、[高风险] 影响磁盘或作用域。使用纪律：\n1. 查要小页——先用 list_mods / get_load_order / read_logs 的 limit+offset（或 filter/keyword）定向取数，禁止无 limit 拉全量；响应信封里的 next_offset 用于翻页。\n2. 变要增量——加载顺序变更一律走 apply_load_order_ops，先 dry_run:true 预演再落盘；禁止「读全量→改→传全量」的调用链。\n3. token 续链——写加载顺序必须回传上一次响应的 version_token / new_version_token；冲突时按错误里的 nextActions 重取基线。\n4. 答要摘要——日志排查按 list_log_files → read_logs（levels 过滤、tail 尾读优先）→ get_log_context 逐级收敛，不要整文件回传。\n5. 走闭环——获取：resolve_missing_dependencies → download_workshop_mods → wait_event(\"scan-complete\") → list_mods；排障：search_mod_text 在模组源码里取证，launch_game 后用 get_game_status / wait_event(\"game-status-changed\") 跟踪，再 read_logs 验证；整理：parse_load_order 解析 → apply_load_order_ops 落地。\n异步操作（scan_mods / 下载）完成后可用 wait_event 等待，或轮询 list_mods / get_download_tasks 确认。",
+  "instructions": "RimCrow（RimWorld 模组管理器）的 MCP 接口。工具按风险标注只读/写入/高风险（对应 MCP ToolAnnotations 的 readOnlyHint / destructiveHint）。使用约定：\n1. 分页取数——list_mods / get_load_order / read_logs 用 limit+offset（或 filter/keyword）限定范围，避免一次取回全部；响应里 next_offset 非 null 表示还有下一页。\n2. 增量修改——加载顺序一律用 apply_load_order_ops 提交 ops，先 dry_run:true 校验再正式写入；不要「读全量→改→回传全量」。\n3. 并发控制——写入必须带上最近一次响应的 version_token / new_version_token（乐观锁）；不一致会返回冲突，此时重新 get_load_order 取新 token 后重试。\n4. 返回摘要——日志按 list_log_files → read_logs（levels 过滤、tail 取最新）→ get_log_context 逐层缩小范围，不要回传整份文件。\n5. 按固定流程组合——获取依赖：resolve_missing_dependencies → download_workshop_mods → wait_event(\"scan-complete\") → list_mods；排障：search_mod_text 检索模组文件，launch_game 后用 get_game_status / wait_event(\"game-status-changed\") 跟踪再 read_logs 验证；导入排序：parse_load_order 解析 → apply_load_order_ops 写入。\nscan_mods、下载等异步操作完成后用 wait_event 等待，或轮询 list_mods / get_download_tasks 确认。",
   "tools": [
     {
       "name": "get_initial_data",
@@ -20,7 +20,7 @@
     },
     {
       "name": "list_mods",
-      "description": "[只读] 获取模组列表核心数据(all_mods)。扫描完成或状态变更后调用此方法刷新。\n（MCP 扩展）filter 按 name+packageId 子串匹配(大小写不敏感)；fields 投影字段；\nlimit/offset 分页(信封返回 total/items/next_offset)。不传 limit 时返回全量并由\n体积护栏按元素边界截断(hint 引导继续用 limit/offset/filter)。\n加载顺序用 get_load_order，分组用 get_groups。",
+      "description": "[只读] 模组主表(all_mods)定向查询；扫描或状态变更后用它刷新。\n（MCP 扩展）filter=名称+packageId+workshopId 子串匹配(忽略大小写)；fields=字段投影(未知名被忽略)；\nlimit/offset 分页，响应字段 total/items/next_offset。不传 limit 返回全量，超出响应体积\n上限时服务端按元素边界截断，并附 hint 提示改用 limit/offset/filter 缩小范围。\nscope: all=全部模组(默认)｜active=仅已启用｜inactive=仅未启用；is_active 随行返回。\n加载顺序用 get_load_order，分组用 get_groups。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -56,6 +56,15 @@
           "offset": {
             "default": 0,
             "type": "integer"
+          },
+          "scope": {
+            "default": "all",
+            "enum": [
+              "all",
+              "active",
+              "inactive"
+            ],
+            "type": "string"
           }
         },
         "type": "object"
@@ -67,7 +76,7 @@
     },
     {
       "name": "get_load_order",
-      "description": "[只读] 获取当前档案的加载顺序信息。\n（MCP 扩展）limit/offset 分页，响应信封含 version_token(写入前必须原样回传)；\nitems 为按加载顺序排列的 {package_id, name, workshop_id} 记录，fields 可投影，\n仅支持 package_id / name / workshop_id 三个字段（其它字段不支持，请勿传入）。",
+      "description": "[只读] 当前档案的加载顺序（该数据的权威来源）；写入时须原样回传响应中的\nversion_token 做冲突检测。\n（MCP 扩展）items 按顺序给出 {package_id,name,workshop_id}，支持 filter/limit/offset\n分页；fields 只在这三个字段内投影，传其它字段会被静默忽略，不会报错。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -139,7 +148,7 @@
     },
     {
       "name": "list_profiles",
-      "description": "[只读] 列出所有游戏档案(profile)。\n（MCP 扩展）默认不含 inactive_mods_order/temp_mods_order 整序数组（大载荷剥离，\n「查要小」纪律）；激活加载顺序请用 get_load_order。",
+      "description": "[只读] 全部游戏档案(profile)。\n（MCP 扩展）默认不含 inactive_mods_order/temp_mods_order 两个大数组(控制响应体积)；\n激活的加载顺序用 get_load_order。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {},
@@ -152,7 +161,7 @@
     },
     {
       "name": "read_logs",
-      "description": "[只读] 分页读取系统日志(JSONL),适合错误排查与 AI 诊断。\n参数 log_type / filename 从 list_log_files 等来源获取,缺省按 active 档案。\n（MCP 扩展）levels 按级别过滤(如 [\"error\",\"warning\"])；since/until 时间范围\n(支持 \"1h\"/\"30m\" 相对量或 ISO 时间)；line_from/line_to 行号范围；keyword 子串；\ntail=N 只取最新的 N 条匹配(提前停止扫描)；默认即尾读(第 1 页为最新)。\n返回窗口由 limit / offset / tail 决定；page_size 只是内部扫描时每次向后端请求的\n页大小(默认 1000)，不决定返回条数，通常不需要传。\ntail 模式返回 paging:\"tail\" 且 next_offset 恒为 null（一次性取尾，不可翻页）。\n每条返回条目都带 raw_lines(该日志块对应的源日志行号列表,1 基)——它是\nget_log_context.target_line 的唯一合法来源(取 raw_lines[0])。",
+      "description": "[只读] 分页读系统日志(JSONL)；默认从最新一条开始读，第 1 页即最新。\nlog_type/filename 取自 list_log_files(缺省=active 档案的最新文件)。\n（MCP 扩展）levels=[\"error\",\"warning\"] 按日志级别过滤；since/until 支持 \"1h\"/\"30m\"\n相对时间或 ISO 时间；line_from/line_to 行号区间；keyword 子串匹配；tail=N 只保留\n最新 N 条并提前结束扫描(返回 paging=\"tail\"、next_offset 恒为 null，不能翻页)。\n返回窗口由 limit/offset/tail 决定；page_size 只是内部单次请求的页大小，无需传。\n每条返回 raw_lines(日志源行号，从 1 开始)——get_log_context.target_line 只接受\nraw_lines[0]；编辑器/grep 统计的行号属于另一坐标系，不可混用。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -270,10 +279,15 @@
     },
     {
       "name": "get_settings_overview",
-      "description": "[只读] 获取模组设置概览。\n单次返回当前档案的全量概览,体量很大(实测单次约 124KB)且没有分页/过滤参数,\n只在需要全貌时调用,取到后不要整包回传。",
+      "description": "[只读] 获取模组设置概览。\n单次返回当前档案的全量概览,体量很大(实测单次约 124KB),只在需要全貌时调用,\n取到后不要整包回传。\n只想看一个模组时传 package_id:与概览里的 mod_groups[].package_id 精确匹配\n(忽略大小写),只返回 config_path + 命中的 mod_groups,扫描级统计量不随行;\n无命中时 mod_groups 为空并附 hint。不传 package_id 保持全量返回(向后兼容)。",
       "inputSchema": {
         "additionalProperties": false,
-        "properties": {},
+        "properties": {
+          "package_id": {
+            "default": "",
+            "type": "string"
+          }
+        },
         "type": "object"
       },
       "annotations": {
@@ -283,10 +297,26 @@
     },
     {
       "name": "get_groups",
-      "description": "[只读] 获取全部分组及其模组归属(含 group_id/name/color/sort_index/mod_ids)。",
+      "description": "[只读] 获取全部分组及其模组归属(含 group_id/name/color/sort_index/mod_ids)。\nlimit/offset 分页,响应字段 total/items/next_offset;不传 limit 返回全量。",
       "inputSchema": {
         "additionalProperties": false,
-        "properties": {},
+        "properties": {
+          "limit": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "offset": {
+            "default": 0,
+            "type": "integer"
+          }
+        },
         "type": "object"
       },
       "annotations": {
@@ -296,7 +326,7 @@
     },
     {
       "name": "wait_event",
-      "description": "[只读] 等待后端事件(如 \"scan-complete\")到达,超时返回 timeout 状态。\n等待开始时先丢弃队列中已积压的陈旧事件,单等待者场景下只有等待期间新到达的\n事件会命中;用于 scan_mods 等异步操作完成后的确认。\n（MCP 扩展）事件队列为单例：多个并发等待者会互相消费事件(另一等待者可能先取走\n你正在等的事件)；且只捕获内嵌端点就绪之后发出的事件——启动早期的事件请轮询\nlist_mods 确认，不要盲等。事件条目不带发生时间字段,命中后请核对 data 再采信。",
+      "description": "[只读] 等待后端事件(如 \"scan-complete\"、\"game-status-changed\")，超时返回\ntimeout 状态。用于确认 scan_mods / launch_game 等异步操作已完成。\n（MCP 扩展）事件队列全局唯一：并发等待会互相取走事件；开始等待时先清空积压事件，\n因此只命中等待期间新到的事件；服务端就绪前发出的事件捕获不到——启动早期请改为轮询\nlist_mods。事件不含发生时间，取到后先核对 data 再使用。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -400,7 +430,7 @@
     },
     {
       "name": "save_load_order",
-      "description": "[写] 保存激活列表到 ModsConfig.xml,带磁盘冲突保护(token 校验)。\nactive_ids 为完整的目标激活列表;base_version_token 在 schema 里可选(默认 null),\n但强烈建议传此前读取到的版本 token——不传会跳过磁盘冲突保护,可能覆盖外部改动。\n（MCP 扩展）⚠ 大载荷：这是全量回传形态,仅作兼容保留；顺序调整请优先用\napply_load_order_ops(增量、原子、带 dry_run)。本工具为既有调用方保留兼容,\n不设移除版本号;如确需移除,须先确认无调用方并另行公告。",
+      "description": "[写] 把激活列表全量写入 ModsConfig.xml，带 version_token 冲突检测。\nactive_ids 必须是完整目标列表；base_version_token 在 schema 中可选但必须传，\n否则跳过冲突检测，可能覆盖其它程序对该文件的改动。\n（MCP 扩展）⚠ 全量返回、体积大，仅作兼容保留——顺序调整改用\napply_load_order_ops(增量操作、原子提交、支持 dry_run)。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -877,7 +907,7 @@
     },
     {
       "name": "get_mod_dependencies",
-      "description": "[只读] 查询模组间的依赖/顺序关系图(参数名是驼峰 packageId，与其它工具的 package_id 不同)，支持多级展开与环路报告。\npackageId 起点；direction: up=声明指向我的边(谁依赖我/要求在我之后，删除前影响分析用)、\ndown=我声明的边(我依赖谁/要求谁在我之后)、both=双向；depth=1..5 展开层级；\nformat=edges 返回平铺边表 [{from,to,relation,depth}](默认，省 token、可截断)，\ntree 仅 depth<=2 允许(嵌套结构)。环路(loadBefore/After 互指)单独报 cycles，不死循环。\nedges 上限 500 条：响应 truncated:true 表示还有边没收齐；本工具没有续取参数，\n只能用 direction/depth 收窄范围后重新查询。\n单模组规则明细(含权重/来源/遮蔽)请用 get_mod_rules。",
+      "description": "[只读] 模组依赖与加载顺序关系图（参数名是驼峰 packageId，与其它工具的 package_id 不同）。\ndirection: up=指向我的边(谁依赖我/要求排在我之后，用于删除前的影响分析)｜down=我指出的\n边(我依赖谁/我要求谁排在后面)｜both=双向；depth 1..5。\nformat=edges 返回平铺边表 {from,to,relation,depth}(体积小)｜tree 为嵌套结构，仅 depth<=2。\n环路(loadBefore/After 互指)单独列在 cycles，不会无限递归。edges 最多 500 条，\ntruncated:true 表示未取全——本工具没有翻页参数，请缩小 direction/depth 后重查。\n直接关系(1-hop)的规则明细用 get_mod_rules。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -918,7 +948,7 @@
     },
     {
       "name": "list_log_files",
-      "description": "[只读] 列出可读日志文件(name/path/size/mtime，按修改时间倒序)，\n是 read_logs / get_log_context 的 filename 来源；log_type: \"game\"|\"app\"。\nlog_type 不是枚举(schema 为 string)，只有 game / app 两个有效值，\n其它值(含空串)会静默按 game 处理。",
+      "description": "[只读] 可读日志文件列表(name/path/size/mtime 按修改倒序)，是 read_logs /\nget_log_context 的 filename 来源。log_type 仅 game|app 有效(schema 是 string)，\n其它值(含空串)静默按 game 处理。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -940,7 +970,7 @@
     },
     {
       "name": "apply_load_order_ops",
-      "description": "[写] 以增量操作原子地修改加载顺序（推荐的顺序变更入口）。\nops 逐条执行、整体全有全无：{\"op\":\"insert\",\"id\":X,\"anchor\":{after|before|index}}、\n{\"op\":\"remove\",\"ids\":[...]}, {\"op\":\"move\",\"id\":X,\"to\":{index|after|before}},、\n{\"op\":\"activate\",\"ids\":[...]}, {\"op\":\"deactivate\",\"ids\":[...]}（上限 100 条）。\nbase_version_token 来自 get_load_order 响应；dry_run:true 只校验不落盘。\n落盘成功(dry_run=false)的响应含 summary/conflicts/new_version_token，绝不回传全量列表；\ndry_run 的响应只有 summary/conflicts，不含 new_version_token(只有真正写盘才发新 token)。",
+      "description": "[写] 用增量操作原子地修改加载顺序（顺序变更的推荐入口）。\nops 整批全有全无、最多 100 条：insert{id,anchor:{after|before|index}}｜remove{ids}｜\nmove{id,to:{index|after|before}}｜activate{ids}｜deactivate{ids}。\nbase_version_token 取自 get_load_order(用于冲突检测)；dry_run:true 只校验、不写入，\n也不会返回 new_version_token。写入成功返回 summary/conflicts/new_version_token，\n不返回完整列表。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -973,7 +1003,7 @@
     },
     {
       "name": "set_mod_rule",
-      "description": "[写] 增、改或删一条本模组的用户排序/冲突规则（AI 助手\"应用模组规则\"动作的同源能力）。\nrelation: loadAfter=本模组必须排在 target_id 之后(target 是前置)、loadBefore=必须排在\ntarget_id 之前、incompatibleWith=两者不应同时启用;remove:true 只删除指定的这一条关系,\n该模组其它既有规则一律保留(合并写入,非整包替换)。comment 为可选备注,显示在规则管理界面。\n内容无变化时返回 action=noop 不落盘;规则即时写盘并影响后续自动排序,建议写前用\nget_mod_rules(package_id) 确认现状。",
+      "description": "[写] 新增、修改或删除本模组的一条用户排序/冲突规则。\nrelation: loadAfter=必须排在 target 之后(target 为前置)｜loadBefore=必须排在 target\n之前｜incompatibleWith=两者不应同时启用。remove:true 只删除这一条，其余规则保留\n(合并写入，不是整体替换)；内容无变化时返回 action=noop，不写入磁盘。\n规则立即写入并参与后续自动排序——建议先用 get_mod_rules 查看现状；\ncomment 是界面上显示的可选备注。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -1014,7 +1044,7 @@
     },
     {
       "name": "get_game_status",
-      "description": "[只读] 获取游戏运行状态与启动会话信息。\n返回 running(游戏进程是否在跑)、steam_running(Steam 客户端是否在跑)、\nruntime_session(最近一次启动会话的 id/状态/档案)。launch_game 之后用本工具\n或 wait_event(\"game-status-changed\") 跟踪启动结果。",
+      "description": "[只读] 游戏运行状态：running、steam_running、runtime_session(最近启动会话的\nid/状态/档案)。launch_game 后用本工具或 wait_event(\"game-status-changed\") 跟踪。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {},
@@ -1027,7 +1057,7 @@
     },
     {
       "name": "launch_game",
-      "description": "[写] 启动游戏(默认当前档案)。成本/副作用:会拉起 RimWorld 进程并可能同步\n运行时链接;请确认确实需要启动验证后再调用。\n后端检测到 Steam 冲突等启动前风险时不直接启动,而是返回需要确认的 warning:\n此时本工具以 isError 返回并在 nextActions 里给出处置指引,用 confirm_action\n重新调用即可继续(confirm_action 取值:continue=确认直启 / wait_steam_exit=\n等 Steam 退出 / retry_steam_client / retry_steam_url=换 Steam 方式重试 /\ncancel=取消启动)。启动已发起后用 get_game_status 跟踪。",
+      "description": "[写] 启动游戏(默认当前档案)。会创建 RimWorld 进程，并可能同步模组链接(_Link_)，\n确认需要后再调用。检测到启动前风险(如 Steam 正在运行)时不启动，改以 isError 返回\nwarning，并在 nextActions 中给出后续步骤：用 confirm_action 重新调用\n(continue=继续启动｜wait_steam_exit=等待 Steam 退出｜retry_steam_client /\nretry_steam_url=换 Steam 方式重试｜cancel=取消)。启动后用 get_game_status 跟踪。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -1049,7 +1079,7 @@
     },
     {
       "name": "search_mod_text",
-      "description": "[只读] 在模组源码文件内容里做子串/正则搜索(ripgrep 语义),排障取证用:\n定位报错文本出自哪个模组哪个文件、某个 Def 字符串被谁定义等。\nscope: current-active=当前启用模组(默认,排障首选)、current-effective=当前生效\n(含补丁覆盖)、workshop/local/self=按库全量(慢);file_types 默认含 xml/json/cs。\n返回 matched_count 与按 mod_name/file_path/line_number/matched_line 组织的\nresults;max_results 截断时带 truncated 标记。本工具长等待(默认 120 秒)且与\nwait_event 共用单例事件队列:调用期间不要并发 wait_event,会互抢事件。",
+      "description": "[只读] 在模组文件中做子串/正则搜索(ripgrep)，用于定位问题：报错文本出自哪个模组、\n某个 Def 由谁定义。\nscope: current-active=已启用模组(默认，排障首选)｜current-effective=当前环境可见的\n全部模组(含未启用)，并按 LoadFolders 只保留实际会加载的文件——版本目录取不高于当前\n游戏版本的最高者，IfModActive/DLC 条件按当前已启用集合判定｜workshop/local/self=\n按各自的模组库全量搜索(较慢)。\nfile_types 限定扩展名，默认 [\".xml\"]；要搜全部类型(含二进制)传 [\".\"]。\nfilenames_only=true 改为按文件名或模组内相对路径匹配(查「哪个模组带这张贴图/dll」)：\n不读文件内容，结果 line_number=0、matched_line 为命中的文件名或相对路径；此模式下\n不应用 Textures/Source/Languages 目录排除，未给 file_types 则不限扩展名。\n返回 matched_count 与 results[{mod_name,file_path,line_number,matched_line}]，\n条数超过 max_results 时 truncated=true。本工具耗时较长(默认 120 秒)，与 wait_event\n共用同一个事件队列，调用期间不要同时调用 wait_event。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -1082,6 +1112,24 @@
           "timeout_seconds": {
             "default": 120.0,
             "type": "number"
+          },
+          "file_types": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "filenames_only": {
+            "default": false,
+            "type": "boolean"
           }
         },
         "required": [
@@ -1096,7 +1144,7 @@
     },
     {
       "name": "parse_load_order",
-      "description": "[只读] 解析一个排序文件或分享码,零写入:只返回解析结果与缺失项检查,\n不改动当前加载顺序。path 与 share_code 二选一(都传以 path 为准)。\n支持 ModsConfig.xml / ModList.xml / RML / RimSort 导出与分享码。\n返回 format/total/active_ids(供 apply_load_order_ops 落地用)/warnings/errors/\nimport_check(缺失模组清单与摘要)。落地请走 apply_load_order_ops。",
+      "description": "[只读] 解析排序文件或分享码，只读——不修改当前加载顺序。path / share_code 二选一\n(都传时以 path 为准)。支持 ModsConfig.xml、ModList.xml、RML、RimSort 导出与分享码。\n返回 format/total/active_ids/warnings/errors/import_check(缺失模组清单)；\nactive_ids 可直接作为 apply_load_order_ops 的入参。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -1118,7 +1166,7 @@
     },
     {
       "name": "export_load_order",
-      "description": "[高风险] 把当前激活加载顺序导出为文件或分享码。\nexport_format=share_code 时直接返回 share_code 字符串,path 必须为空;\n其余格式(modsconfig/modlist/rml)必须给 path(完整目标文件路径,含扩展名),\n会写磁盘文件——请确认 path 正确后再调用。当前激活列表由服务端自读,不需要传。",
+      "description": "[高风险] 导出当前激活的加载顺序。export_format=share_code 时直接返回分享码字符串\n(path 留空)；modsconfig/modlist/rml 必须给完整 path(含扩展名)，会创建文件，调用前确认\n路径正确。激活列表由服务端读取，不需要传。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -1152,7 +1200,7 @@
     },
     {
       "name": "smart_insert_mods",
-      "description": "[写] 用规则引擎把给定模组智能插入当前激活列表并落盘(推荐的新模组入库入口)。\n插入位置由依赖/规则自动决定,agent 只需给出要插入的 package_ids(上限 100)。\nbase_version_token 来自 get_load_order 响应(过期即拒绝,同 apply_load_order_ops);\ndry_run:true 只返回插入锚点与摘要不落盘。成功响应含 applied 锚点(逐条\n{id,index,after})/auto_activated(联锁自动激活项)/new_version_token,不回传全表。",
+      "description": "[写] 用规则引擎把模组插入激活列表并写入 ModsConfig.xml（新模组加入列表的推荐入口）。\n插入位置由依赖与规则决定，只需传 package_ids(最多 100 个)；base_version_token 取自\nget_load_order(过期会被拒绝)。dry_run:true 只返回插入位置与摘要、不写入；成功返回\napplied[{id,index,after}]、auto_activated(随之自动启用的联锁项)、new_version_token，\n不返回完整列表。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -1184,7 +1232,7 @@
     },
     {
       "name": "set_mod_absolute_position",
-      "description": "[写] 设置/清除某模组的用户固定位置规则(top=置顶,bottom=置底,none=清除),\n影响后续自动排序;写前可用 get_mod_rules 确认现状。comment 为可选备注。",
+      "description": "[写] 设置/清除模组的用户固定位置规则(top=置顶｜bottom=置底｜none=清除)，\n影响后续自动排序；写前用 get_mod_rules 看现状，comment 为可选备注。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -1217,7 +1265,7 @@
     },
     {
       "name": "get_residue_overview",
-      "description": "[只读] 读取当前扫描范围内的卸载残留目录与关联设置文件总览(纯读,不清理)。\n用于整理前评估哪些残留可以人工清理;清理动作属批量磁盘变更,不在工具面内。",
+      "description": "[只读] 当前扫描范围内的卸载残留目录与关联设置文件总览(只读，不删除)。\n供清理前评估；删除文件属批量磁盘变更，本工具不执行。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {},
@@ -1230,7 +1278,7 @@
     },
     {
       "name": "trace_install_sources",
-      "description": "[只读] 按 package_id 批量查询原始安装来源与替代安装来源(外置数据库本地查询)。\n返回 {package_id: {original: [...], replacement: [...]}} ,来源条目含\nworkshop_id/url/name/kind/supported_versions;查不到的 id 不在返回里。\n拿到 workshop_id 后可用 download_workshop_mods 补下载。上限 100 个 id。",
+      "description": "[只读] 按 package_id 批量查询模组的安装来源(外置数据库本地查询)，最多 100 个 id。\n返回 {package_id:{original:[],replacement:[]}}，条目含 workshop_id/url/name/kind/\nsupported_versions；查不到的 id 不在返回中。拿到 workshop_id 后可作为\ndownload_workshop_mods 的入参补下载。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -1253,7 +1301,7 @@
     },
     {
       "name": "resolve_missing_dependencies",
-      "description": "[只读] 检测启用列表(或给定 package_ids)缺失的前置依赖,并转换为可下载的\n工坊 ID 清单(本地规则+清单库为主,补名称时访问 Steam Web API,可能数秒)。\npackage_ids 缺省时服务端自读当前激活列表。返回 missing:\n[{workshop_id,name,preview_url}];直接可喂给 download_workshop_mods。",
+      "description": "[只读] 找出缺失的前置模组并给出可下载的 workshop ID（创意工坊物品 ID）。不传\npackage_ids 时由服务端读取当前激活列表。返回 missing:[{workshop_id,name,preview_url}]，\nworkshop_id 可直接作为 download_workshop_mods 的入参；补充名称时可能联网，耗时数秒。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -1281,7 +1329,7 @@
     },
     {
       "name": "download_workshop_mods",
-      "description": "[写] 用 SteamCMD 下载/更新指定工坊项,立即返回 task_id。\n成本/副作用:网络下载+写入工坊目录,下载成功后后端会自动触发一次全量扫描。\n进度用 get_download_tasks 轮询;入库确认等 wait_event(\"scan-complete\") 后\nlist_mods。SteamCMD 未就绪会报因果错误(先在 GUI 工具环境检查里修复)。",
+      "description": "[写] 用 SteamCMD 下载/更新创意工坊物品，立即返回 task_id（联网并写入创意工坊目录，\n完成后自动触发一次全量扫描）。进度用 get_download_tasks 轮询；要确认已下载并完成扫描，\n需等 wait_event(\"scan-complete\") 后调用 list_mods。SteamCMD 未就绪时返回 isError 错误、\n正文含 nextActions——按其指引先在 GUI 的工具环境检查中修复。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -1317,10 +1365,95 @@
     },
     {
       "name": "check_mod_updates",
-      "description": "[只读] 检查已安装模组的可用更新(workshop 域走 Steamworks 本机状态,self 域走\nSteam Web API 在线时间比对)。返回 updates: [{workshop_id,title,source,\nlocal_time,online_time}]。访问网络,可能耗时十几秒;Steam 未运行时 workshop 域\n会被跳过(响应内注明),结果按实际覆盖面采信。",
+      "description": "[只读] 检查已安装模组是否有可用更新：创意工坊模组用 Steamworks 本机状态比对，\n自身(self)模组用 Steam Web API 比对更新时间。返回 updates:\n[{workshop_id,title,source,local_time,online_time}]。需要联网、耗时十几秒；Steam 未\n运行时创意工坊部分会被跳过(响应中注明)，结果按实际覆盖范围采信。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {},
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "cancel_task",
+      "description": "[写] 取消一个进行中的后台任务——发起 search_mod_text / 下载 / 扫描这类长任务后\n不必干等。task_type 只接受上游统一取消入口实际路由的 16 种取值（api.py:5711 逐类型\n分派，与前端 cancellableTaskTypes 同集合）：scan｜download｜update｜localize｜\nmod-import｜mod-export｜steamcmd-download｜steamcmd-workshop-repair｜steamcmd-init｜\nsteam-subscribe｜steam-unsubscribe｜steam-workshop-download｜texture-opt｜\ntexture-opt-analyze｜ai-task｜file-search。\ntask_id 取自发起任务的响应（scan_mods 的 data.details.task_id、search_mod_text 与\ndownload_workshop_mods 的 task_id）；仅 task_type=scan 可留空＝取消当前扫描\n（api.py:5731 传 None）。取消是**请求**语义：返回成功只代表已发出请求，不代表任务\n已终止——用 get_download_tasks / wait_event(\"scan-complete\") 复核实际结果。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "task_type": {
+            "enum": [
+              "scan",
+              "download",
+              "update",
+              "localize",
+              "mod-import",
+              "mod-export",
+              "steamcmd-download",
+              "steamcmd-workshop-repair",
+              "steamcmd-init",
+              "steam-subscribe",
+              "steam-unsubscribe",
+              "steam-workshop-download",
+              "texture-opt",
+              "texture-opt-analyze",
+              "ai-task",
+              "file-search"
+            ],
+            "type": "string"
+          },
+          "task_id": {
+            "default": "",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_type"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "read_mod_file",
+      "description": "[只读] 读取单个模组文件的文本内容（search_mod_text 只回匹配行，要看上下文用本\n工具读全文）。path 必须落在当前环境**已知模组根目录内**：DLC / 本地 Mods / 自身\nMods / 工坊 Mods / 工具模组目录，或已扫描到的模组自身路径；含 `..` 的路径与越界\n路径一律拒绝——这不是任意文件读取工具。\n单次最多读 64 KiB：上游 path_read_text_file 的默认上限是 2 MB（api.py:4853 /\nmgr_files.py:626），本工具按工具层输出预算收窄；文件更大时 truncated=true，\nfile_size 仍是完整字节数、content 只到文件开头，超限部分不返回。\n返回 file_path / content / truncated / file_size / encoding / max_bytes；encoding\n为实际使用的解码编码（按 BOM 与内容依次探测）。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "get_workshop_mod_details",
+      "description": "[只读] 按创意工坊物品 ID 批量查详情（标题/作者/预览图/更新时间），一次最多\n100 个（与上游单批在线请求同量级，mgr_steam_api.py:654），更多请分批。ID 取自\nget_residue_overview / trace_install_sources / resolve_missing_dependencies 等返回的\nworkshop_id；上游先规范化（纯数字 6..20 位，非法与重复的直接跳过，\nmgr_steam_api.py:1012）。返回 data = {workshop_id: {workshop_id, package_id, title,\nname, author, preview_url, url, time_updated, detail_source, available}}；\ndetail_source: online=在线命中｜database=仅本地库缓存｜unavailable=两处都没有，\navailable=false 即查不到该 ID。可能联网（Steam GetPublishedFileDetails），在线拿不到\n时自动降级为本地库数据；所有 ID 都无效时 data 为空对象。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "workshop_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "workshop_ids"
+        ],
         "type": "object"
       },
       "annotations": {

@@ -15,10 +15,17 @@
 //! - **R5** 探活通过绝不二次拉起（D11）；`--spawn` 只在未检出 endpoint 时拉起。
 //! - **R8** 版本自报三元组 + attach 后上游/快照版本比对（stderr 警告一行）。
 //! - **R9** 桥无状态：进程内只持有「endpoint 路径 / 上游会话」，不缓存清单。
+//! - **参数预校验（防「假成功」，2026-09-28）**：`tools/call` 转发前，把调用参数对照
+//!   「当前生效清单」（**live 优先、拿不到才用嵌入快照**，与 R2 同源）拦一道——schema 未
+//!   声明的参数 / 明显类型不符 / enum 越界 → `isError:true` + 因果文案 + 已知参数列表；
+//!   未知工具、空参数、合法参数一律零影响，原样转发（规则与误杀防护见 `validate.rs`）。
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+
+use serde_json::{Map, Value};
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ClientCapabilities, ClientConfig,
@@ -34,6 +41,7 @@ use crate::envelope::build_error_text;
 use crate::endpoint::{probe_default, EndpointInfo, ProbeOutcome, ProbeStatus};
 use crate::snapshot::{self, Snapshot};
 use crate::spawn;
+use crate::validate::{self, ArgIssue};
 
 /// bridge 自身版本（crate 版本，R8 三元组第一项）。
 pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -406,6 +414,114 @@ impl Bridge {
         ];
         Self::error_result(&message, actions)
     }
+
+    // ---- 参数预校验（防「假成功」：新参数被旧 GUI 静默忽略） ----
+
+    /// 当前生效清单：live（上游实时 `tools/list`）优先，拿不到才用嵌入快照——与 R2 同源，
+    /// 校验基准永远是「当前生效的那份清单」，不是写死的快照。
+    ///
+    /// 返回 `(清单, 来源描述)`；来源描述会进错误文案，点出判据来自谁（live ≠ 快照时不至于误读）。
+    /// 不缓存清单（R9 桥无状态：每次现拉）。
+    fn effective_tools(
+        live: Result<Vec<Tool>, String>,
+        upstream_version: Option<&str>,
+    ) -> (Cow<'static, [Tool]>, String) {
+        match live {
+            Ok(tools) => {
+                let ver = upstream_version.unwrap_or("未知版本（上游未上报 serverInfo.version）");
+                (
+                    Cow::Owned(tools),
+                    format!("运行中 RimCrow {ver} 的实时 tools/list"),
+                )
+            }
+            Err(e) => {
+                tracing::warn!("参数预校验：上游 tools/list 不可用，回退嵌入快照：{e}");
+                let snap = snapshot::load();
+                (
+                    Cow::Borrowed(snap.tools.as_slice()),
+                    format!(
+                        "桥内嵌快照 RimCrow {} @ {}（上游 tools/list 不可用）",
+                        snap.rimcrow_version, snap.captured_at
+                    ),
+                )
+            }
+        }
+    }
+
+    /// 参数预校验：现拉「当前生效清单」（live 优先 / 快照兜底）→ 逐参数对照该工具 inputSchema。
+    ///
+    /// 返回 `None` = 放行（原样转发，调用参数一字不改）；`Some` = 拒绝结果（`isError` 信封）。
+    async fn precheck(
+        &self,
+        name: &str,
+        args: &Map<String, Value>,
+        peer: &Peer<RoleClient>,
+        upstream_version: Option<&str>,
+    ) -> Option<CallToolResult> {
+        if args.is_empty() {
+            return None; // 空参数调用零影响，连 tools/list 都不必现拉
+        }
+        let live = self.upstream_list(peer).await;
+        let (tools, source) = Self::effective_tools(live, upstream_version);
+        self.precheck_with(name, args, &tools, &source)
+    }
+
+    /// 按给定清单校验并构造拒绝结果（单测入口：可直接喂快照清单，模拟「无 live」回退态）。
+    fn precheck_with(
+        &self,
+        name: &str,
+        args: &Map<String, Value>,
+        tools: &[Tool],
+        source: &str,
+    ) -> Option<CallToolResult> {
+        if args.is_empty() {
+            return None;
+        }
+        // 清单里没有这个工具 → 不拦：交给上游报 unknown tool（§5 场景 4 增强文案仍在其后生效）
+        let tool = tools.iter().find(|t| t.name.as_ref() == name)?;
+        let schema = Value::Object(tool.input_schema.as_ref().clone());
+        let issues = validate::validate(&schema, &Value::Object(args.clone()));
+        if issues.is_empty() {
+            return None;
+        }
+        let detail = issues
+            .iter()
+            .map(ArgIssue::describe)
+            .collect::<Vec<_>>()
+            .join("；");
+        tracing::warn!(
+            "参数预校验拒绝 {name}：{detail}（清单来源：{source}；rimcrow-mcp {CRATE_VERSION}）"
+        );
+        Some(self.precheck_error(name, &detail, &schema, source))
+    }
+
+    /// 拒绝结果：D6 同形信封（`isError` + message + nextActions）。message 必须点出
+    /// 「服务端版本较旧 / 该参数未被识别」+ 该工具**当前生效的已知参数列表**（便于改参重试）。
+    fn precheck_error(
+        &self,
+        name: &str,
+        detail: &str,
+        schema: &Value,
+        source: &str,
+    ) -> CallToolResult {
+        let known = validate::known_params(schema);
+        let known_txt = if known.is_empty() {
+            "（该工具未声明任何参数）".to_string()
+        } else {
+            known.join("、")
+        };
+        let message = format!(
+            "参数预校验失败：{detail}；服务端版本较旧或该参数/取值未被识别；工具 {name} 当前生效的已知参数：{known_txt}；清单来源：{source}（{}）",
+            self.version_ctx()
+        );
+        let actions = vec![
+            "按上面列出的已知参数改参后重试；未列出的参数不会被服务端识别".to_string(),
+            "调用 tools/list 核对当前生效清单与该工具 inputSchema".to_string(),
+            "若确实需要新参数，同批更新 RimCrow GUI 与 rimcrow-mcp.exe（双产物同一条流水线发布）"
+                .to_string(),
+        ];
+        Self::error_result(&message, actions)
+    }
 }
 
 /// 从上游 `CallToolResult` 提取全部文本内容（用于错配探测，不做其它解释）。
@@ -511,6 +627,17 @@ impl ServerHandler for Bridge {
             Err(degraded) => return Ok(degraded.into()),
         };
 
+        // 参数预校验（防「假成功」）：调用带参数时，先按当前生效清单拦下会被旧 GUI
+        // 静默忽略的参数（live 优先、拿不到 live 回退快照）；合法/空参数零影响照原样转发。
+        if let Some(args) = request.arguments.as_ref() {
+            if let Some(rejected) = self
+                .precheck(&name, args, &peer, upstream_version.as_deref())
+                .await
+            {
+                return Ok(rejected.into());
+            }
+        }
+
         match peer.call_tool_once(request).await {
             Ok(CallToolResponse::Complete(result)) => {
                 // R3：远端 isError 文案逐字回抛（仅 §5 场景 4 的 unknown tool 例外增强）
@@ -581,6 +708,7 @@ impl ServerHandler for Bridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn unknown_tool_detection() {
@@ -701,5 +829,123 @@ mod tests {
             assert!(r.is_err());
             assert_eq!(gate.attempts(), 0);
         });
+    }
+
+    // ---- 参数预校验（防「假成功」） ----
+
+    /// 造一个最小工具（`rmcp::model::Tool` 是 `#[non_exhaustive]`，只能反序列化构造）。
+    fn tool_named(name: &str) -> Tool {
+        serde_json::from_value(json!({"name": name, "inputSchema": {"type": "object"}}))
+            .expect("tool json")
+    }
+
+    fn bridge_for_test() -> Bridge {
+        Bridge::new(crate::Options {
+            spawn: false,
+            headless: false,
+        })
+    }
+
+    #[test]
+    fn effective_tools_prefers_live_over_snapshot() {
+        let live = vec![tool_named("echo_tool")];
+        let (tools, source) = Bridge::effective_tools(Ok(live), Some("9.9.9"));
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name.as_ref(), "echo_tool");
+        assert!(source.contains("实时"), "{source}");
+        assert!(source.contains("9.9.9"), "{source}");
+        assert!(
+            !source.contains("快照"),
+            "live 优先，不得回落快照：{source}"
+        );
+    }
+
+    #[test]
+    fn effective_tools_falls_back_to_snapshot_without_live() {
+        let (tools, source) = Bridge::effective_tools(Err("上游 tools/list 超时".into()), None);
+        let snap = snapshot::load();
+        assert_eq!(tools.len(), snap.tools.len());
+        assert!(source.contains("快照"), "{source}");
+        assert!(source.contains("不可用"), "{source}");
+        assert!(source.contains(&snap.rimcrow_version), "{source}");
+    }
+
+    /// 必做覆盖 ①（bridge 层）：未知参数被拒，且文案带出生效清单的已知参数列表。
+    #[test]
+    fn precheck_rejects_unknown_arg_and_lists_known_params() {
+        let bridge = bridge_for_test();
+        let snap = snapshot::load();
+        let args: Map<String, Value> =
+            serde_json::from_value(json!({"definitely_bogus": 1, "limit": 3})).unwrap();
+        // 无 live 清单 → 直接喂快照清单（= 回退态仍能校验，见 effective_tools_falls_back_…）
+        let source = "桥内嵌快照 RimCrow 0.24.7 @ 2026-09-27（上游 tools/list 不可用）";
+        let result = bridge
+            .precheck_with("list_mods", &args, &snap.tools, source)
+            .expect("unknown arg must be rejected before forwarding");
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "MCP 标准错误结果 = isError:true"
+        );
+
+        let text = tool_result_text(&result);
+        // ZCode 私有字段（另一客户端的工具结果字段）不得引入
+        assert!(
+            !text.contains("ttlMs") && !text.contains("cacheScope"),
+            "{text}"
+        );
+
+        let v: Value = serde_json::from_str(&text).expect("envelope must be valid JSON");
+        assert_eq!(v["status"], "error");
+        let msg = v["message"].as_str().expect("message");
+        assert!(msg.contains("list_mods"), "{msg}");
+        assert!(msg.contains("definitely_bogus"), "{msg}");
+        assert!(msg.contains("未被识别"), "{msg}");
+        assert!(msg.contains("版本较旧"), "{msg}");
+        assert!(msg.contains(source), "文案要说明清单来源：{msg}");
+        // 已知参数列表必须来自生效清单的 inputSchema（逐个出现，便于改参重试）
+        let schema = Value::Object(
+            snap.tools
+                .iter()
+                .find(|t| t.name.as_ref() == "list_mods")
+                .expect("snapshot list_mods")
+                .input_schema
+                .as_ref()
+                .clone(),
+        );
+        let known = validate::known_params(&schema);
+        assert!(!known.is_empty());
+        for k in &known {
+            assert!(msg.contains(k), "已知参数 {k} 未出现在文案：{msg}");
+        }
+        // 两侧版本点名（既有错误风格）
+        assert!(msg.contains(CRATE_VERSION), "{msg}");
+        assert!(msg.contains(&snap.rimcrow_version), "{msg}");
+        let actions = v["nextActions"].as_array().expect("nextActions");
+        assert!(actions.len() >= 2, "{actions:?}");
+    }
+
+    /// 必做覆盖 ②：合法参数零影响（放行 → 原样透传），空参数/未知工具也不拦。
+    #[test]
+    fn precheck_passes_known_args_for_passthrough() {
+        let bridge = bridge_for_test();
+        let snap = snapshot::load();
+        let args: Map<String, Value> =
+            serde_json::from_value(json!({"scope": "active", "limit": 3, "offset": 0})).unwrap();
+        assert!(
+            bridge
+                .precheck_with("list_mods", &args, &snap.tools, "测试")
+                .is_none(),
+            "已知参数必须原样放行"
+        );
+        // 空参数 → 不拦（连清单都不必拉，见 precheck 的早退）
+        let empty = Map::new();
+        assert!(bridge
+            .precheck_with("list_mods", &empty, &snap.tools, "测试")
+            .is_none());
+        // 清单里没有的工具 → 不拦（交给上游 unknown tool 增强文案）
+        assert!(bridge
+            .precheck_with("__nope__", &args, &snap.tools, "测试")
+            .is_none());
     }
 }
