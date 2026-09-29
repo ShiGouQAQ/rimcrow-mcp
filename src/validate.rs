@@ -5,7 +5,7 @@
 //! 返回 `total:2223` 全库结果，`is_active:false` 的条目混在其中）。这类假成功比报错危险，
 //! 故在转发前先由桥拦一道。
 //!
-//! **判定基准与 R2 同源**：live（上游实时 `tools/list`）优先，拿不到才用嵌入快照——
+//! **判定基准与清单双模同源**：live（上游实时 `tools/list`）优先，拿不到才用嵌入快照——
 //! 基准永远是「当前生效的那份清单」，不是写死的快照（谁生效就按谁判）。基准的选取在
 //! `bridge.rs::effective_tools`，本模块只接受「已选好的清单 + 其 inputSchema」。
 //!
@@ -21,7 +21,7 @@
 //! - 缺省参数（没传的键）零影响：不做 `required` 缺失检查（缺了服务端自己会报）；
 //! - `enum` 只对标量取值比对（对象/数组取值的相等性语义拿不准 → 放过）。
 //!
-//! 产物是 `ArgIssue` 列表；错误信封（`isError:true` + message + nextActions，D6 同形）
+//! 产物是 `ArgIssue` 列表；错误信封（`isError:true` + message + nextActions，与 RimCrow 错误信封同形）
 //! 由 `bridge.rs::precheck_error` 组装——本模块不产出工具结果，也不引入 `ttlMs`/`cacheScope`
 //! 之类另一客户端(ZCode)的私有字段。
 

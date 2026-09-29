@@ -1,13 +1,15 @@
 //! 构建期嵌入的工具清单快照（`tools-cache.json`）。
 //!
 //! 快照由 RimCrow 仓库的生成器 `scripts/gen_tool_cache.py` 产出，bridge 侧
-//! 用 `include_str!` 单文件嵌入（SPEC §3：不落外部文件）。
+//! 用 `include_str!` 编译期嵌入：发布形态是单个可执行文件，运行期不落任何
+//! 外部清单文件。
 //!
-//! **人工手抄工具清单被 SPEC 明令禁止** —— 本文件只解析、不生成。
+//! 工具清单只能由生成器从真实工具层导出——手写清单必与实际 schema 走样，
+//! 本文件只解析、不生成。
 //!
 //! 快照只在两种场合充当真相：
-//! 1. `tools/list` 上游不可达时的兜底（R2 保底）；
-//! 2. `initialize` 的 `instructions` / 版本自报（R1、R8，永远不依赖上游）。
+//! 1. `tools/list` 上游不可达时的保底清单；
+//! 2. `initialize` 的 `instructions` / 版本自报（这两样永远不依赖上游）。
 
 use std::sync::OnceLock;
 

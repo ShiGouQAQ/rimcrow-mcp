@@ -1,6 +1,6 @@
 //! `--spawn` / `--spawn-headless`：探活失败时拉起 RimCrow，有界轮询 endpoint 写出。
 //!
-//! - **D11 防重入**：探活通过 → 直接 attach，绝不二次拉起；本模块只在
+//! - **防重入**：探活通过 → 直接 attach，绝不二次拉起；本模块只在
 //!   「未检出可用 endpoint」时被调用，且每个 bridge 进程至多尝试一次
 //!   （由 `SpawnGate` 的 `OnceCell` 保证）。
 //! - 拉起目标解析顺序：
@@ -10,7 +10,7 @@
 //! - `--spawn-headless` = 拉起时附带 `--browser --no-open`（与 desktop 分支等价追加）。
 //! - Windows 下用 `CREATE_NO_WINDOW` 拉起子进程：**不闪控制台窗口**；
 //!   GUI 子进程本身的窗口显示不受该标志影响（正常显示）。
-//! - 就绪判据 = **endpoint 文件写出生效**，不等窗口（D18）；有界 15s。
+//! - 就绪判据 = **endpoint 文件写出生效**，不等 GUI 窗口出现；有界 15s。
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use crate::endpoint::{probe_default, ProbeStatus};
 
-/// 轮询 endpoint 写出的超时上界（SPEC R5 / 验收 5）。
+/// 轮询 endpoint 写出的超时上界。
 pub const SPAWN_TIMEOUT: Duration = Duration::from_secs(15);
 /// 轮询间隔。
 pub const SPAWN_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -177,11 +177,11 @@ pub fn resolve_spawn_plan(headless: bool) -> Result<SpawnPlan, String> {
 
 /// 拉起子进程（Windows：`CREATE_NO_WINDOW`，不闪控制台窗口；GUI 窗口正常显示）。
 ///
-/// **stdio 隔离（R7 强制）**：
+/// **stdio 隔离**：
 /// - `stdin = NUL`：绝不把 JSON-RPC 输入通道交给子进程（否则子进程可能抢读/吞掉客户端消息；
 ///   实测某些控制台子进程会因此在初始化期挂死）
 /// - `stdout = NUL`：子进程 stdout 绝不能混进本桥的 JSON-RPC 通道
-/// - `stderr = inherit`：子进程诊断信息并入本桥 stderr 日志（安全，R7 只约束 stdout）
+/// - `stderr = inherit`：子进程诊断信息并入本桥 stderr 日志（安全，stdout 纪律只约束 stdout）
 ///
 /// `RIMCROW_MCP_SPAWN_NO_WINDOW=0` 可关掉无窗口标志（诊断用）。
 pub fn launch(plan: &SpawnPlan) -> std::io::Result<Child> {
@@ -258,7 +258,7 @@ pub async fn wait_for_endpoint(
 
 /// 拉起 + 等待就绪的完整流程（供 `SpawnGate` 调用）。
 pub async fn spawn_and_wait(endpoint_path: &Path, headless: bool) -> Result<(), String> {
-    // 已经可用就不二次拉起（D11 二次防线，调用方已探过一次）
+    // 已经可用就不二次拉起（二次防线，调用方已探过一次）
     if probe_default(endpoint_path).is_ready() {
         return Ok(());
     }

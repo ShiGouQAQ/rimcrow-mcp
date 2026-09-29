@@ -1,4 +1,4 @@
-//! endpoint 文件契约（SPEC-mcp-embed §4.3, schema_version=1）与探活。
+//! endpoint 文件的结构约定（schema_version=1）与探活。
 //!
 //! 与 RimCrow `backend/mcp_endpoint.py::probe_endpoint` **语义等价**：
 //! - 路径：env `RIMCROW_MCP_ENDPOINT` 覆盖 → `%LOCALAPPDATA%\RimCrow\mcp-endpoint.json`
@@ -28,7 +28,7 @@ pub const MAX_BOOT: f64 = 300.0;
 /// loopback 前缀（Python 侧 `str.startswith("http://127.0.0.1:")`）。
 pub const LOOPBACK_PREFIX: &str = "http://127.0.0.1:";
 
-/// endpoint 文件的结构化形态（字段与 SPEC-mcp-embed §4.3 逐条对应）。
+/// endpoint 文件的结构化形态。
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct EndpointInfo {
     pub url: String,

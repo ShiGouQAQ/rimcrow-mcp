@@ -5,18 +5,18 @@
 //! MCP 客户端 --stdio--> rimcrow-mcp --Streamable HTTP--> RimCrow GUI 内嵌端点
 //! ```
 //!
-//! 行为准则（SPEC-rust-bridge）：
-//! - **R1** `initialize` 永不依赖上游：本地应答，instructions / version 来自嵌入快照。
-//! - **R2** `tools/list` 透传优先：endpoint 探活通过 → 每次实时转发上游全量清单；
+//! 行为准则：
+//! - `initialize` 永不依赖上游：本地应答，instructions / version 来自嵌入快照。
+//! - `tools/list` 透传优先：endpoint 探活通过 → 每次实时转发上游全量清单；
 //!   不可达 → 嵌入快照全量应答。
-//! - **R3** `tools/call` 探活 → HTTP 转发（注入 bearer，`mcp-session-id` 由 rmcp
+//! - `tools/call` 探活 → HTTP 转发（注入 bearer，`mcp-session-id` 由 rmcp
 //!   transport 维护并逐请求携带）→ 远端 `isError` 结果**逐字回抛**。
-//! - **R4** endpoint 缺失 / pid 过期 → `isError:true` + 因果文案 + `nextActions[]`。
-//! - **R5** 探活通过绝不二次拉起（D11）；`--spawn` 只在未检出 endpoint 时拉起。
-//! - **R8** 版本自报三元组 + attach 后上游/快照版本比对（stderr 警告一行）。
-//! - **R9** 桥无状态：进程内只持有「endpoint 路径 / 上游会话」，不缓存清单。
-//! - **参数预校验（防「假成功」，2026-09-28）**：`tools/call` 转发前，把调用参数对照
-//!   「当前生效清单」（**live 优先、拿不到才用嵌入快照**，与 R2 同源）拦一道——schema 未
+//! - endpoint 缺失 / pid 过期 → `isError:true` + 因果文案 + `nextActions[]`。
+//! - 探活通过绝不二次拉起；`--spawn` 只在未检出 endpoint 时拉起。
+//! - 版本自报三元组 + attach 后上游/快照版本比对（stderr 警告一行）。
+//! - 桥无状态：进程内只持有「endpoint 路径 / 上游会话」，不缓存清单。
+//! - 参数预校验（防「假成功」）：`tools/call` 转发前，把调用参数对照
+//!   「当前生效清单」（**live 优先、拿不到才用嵌入快照**）拦一道——schema 未
 //!   声明的参数 / 明显类型不符 / enum 越界 → `isError:true` + 因果文案 + 已知参数列表；
 //!   未知工具、空参数、合法参数一律零影响，原样转发（规则与误杀防护见 `validate.rs`）。
 
@@ -43,7 +43,7 @@ use crate::snapshot::{self, Snapshot};
 use crate::spawn;
 use crate::validate::{self, ArgIssue};
 
-/// bridge 自身版本（crate 版本，R8 三元组第一项）。
+/// bridge 自身版本（crate 版本，版本三元组第一项）。
 pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 建立上游会话的超时。
@@ -54,7 +54,7 @@ const LIST_TIMEOUT: Duration = Duration::from_secs(10);
 /// 上游会话缓存键分隔符（url + token，二者任一变化即重建会话）。
 const KEY_SEP: char = '\u{0}';
 
-/// 已 attach 的上游会话（R9：会话属于允许持有的状态）。
+/// 已 attach 的上游会话（桥只持有 endpoint 路径与会话两类状态，这是其一）。
 struct Upstream {
     key: String,
     svc: RunningService<RoleClient, ClientConfig>,
@@ -131,7 +131,7 @@ impl Bridge {
         probe_default(&self.endpoint_path)
     }
 
-    /// 版本上下文（R8）：crate 版本 + 快照 rimcrow_version + captured_at。
+    /// 版本上下文：crate 版本 + 快照 rimcrow_version + captured_at。
     fn version_ctx(&self) -> String {
         let snap = snapshot::load();
         format!(
@@ -146,7 +146,7 @@ impl Bridge {
         ))])
     }
 
-    /// 由探活结果构造 R4 降级错误（因果 + nextActions，禁空洞 timeout 文案）。
+    /// 由探活结果构造降级错误（因果 + nextActions，禁空洞 timeout 文案）。
     fn degraded_for_probe(&self, out: &ProbeOutcome, spawn_note: Option<&str>) -> CallToolResult {
         let mut actions: Vec<String> = Vec::new();
 
@@ -274,7 +274,7 @@ impl Bridge {
                 Ok(svc) => svc,
                 Err(e) => return Err(self.degraded_connect(&e)),
             };
-            // R8：成功 attach 后比对快照版本与上游 serverInfo.version，不一致 → stderr 一行
+            // 成功 attach 后比对快照版本与上游 serverInfo.version，不一致 → stderr 一行
             if let Some(peer_info) = svc.peer_info() {
                 if let Some(impl_info) = &peer_info.server_info {
                     let snap = snapshot::load();
@@ -326,7 +326,7 @@ impl Bridge {
         }
     }
 
-    /// 嵌入快照 → `tools/list` 结果（保底，R2）。
+    /// 嵌入快照 → `tools/list` 结果（上游不可达时的保底清单）。
     fn snapshot_list(snap: &Snapshot) -> ListToolsResult {
         ListToolsResult {
             tools: snap.tools.clone(),
@@ -346,7 +346,7 @@ impl Bridge {
         }
     }
 
-    /// 工具名错配探测（§5 场景 4 的触发条件）。
+    /// 工具名错配探测：上游回「unknown tool」类文案时的触发条件。
     fn looks_like_unknown_tool(text: &str) -> bool {
         let lower = text.to_lowercase();
         const KEYS: [&str; 10] = [
@@ -366,7 +366,7 @@ impl Bridge {
                 && (lower.contains("not found") || lower.contains("不存在")))
     }
 
-    /// §5 场景 4：新桥 × 旧 GUI → 上游 unknown tool 的增强文案（必须点出两侧版本）。
+    /// 新桥 × 旧 GUI 的 unknown tool：上游报未知工具时改为增强文案（必须点出两侧版本）。
     fn enriched_unknown_tool(
         &self,
         name: &str,
@@ -390,7 +390,7 @@ impl Bridge {
         Self::error_result(&message, actions)
     }
 
-    /// 上游协议错误 → 可读的 isError（D14：认知窗口只有一次调用）。
+    /// 上游协议错误 → 可读的 isError（agent 对一次调用的结果只有一次阅读机会，文案必须自足）。
     fn upstream_protocol_error(&self, err: &McpError, name: &str) -> CallToolResult {
         let message = format!("{}（上游 JSON-RPC code={}）", err.message, err.code.0);
         let actions = vec![
@@ -401,7 +401,7 @@ impl Bridge {
         Self::error_result(&message, actions)
     }
 
-    /// 传输层失败 → R4 因果降级（禁止空洞 timeout 文案）。
+    /// 传输层失败 → 因果降级（禁止空洞 timeout 文案）。
     fn upstream_transport_error(&self, err: &ServiceError) -> CallToolResult {
         let message = format!(
             "上游端点在转发期间失去响应：{err}；当前无法完成 tools/call（{}）",
@@ -417,11 +417,11 @@ impl Bridge {
 
     // ---- 参数预校验（防「假成功」：新参数被旧 GUI 静默忽略） ----
 
-    /// 当前生效清单：live（上游实时 `tools/list`）优先，拿不到才用嵌入快照——与 R2 同源，
+    /// 当前生效清单：live（上游实时 `tools/list`）优先，拿不到才用嵌入快照——
     /// 校验基准永远是「当前生效的那份清单」，不是写死的快照。
     ///
     /// 返回 `(清单, 来源描述)`；来源描述会进错误文案，点出判据来自谁（live ≠ 快照时不至于误读）。
-    /// 不缓存清单（R9 桥无状态：每次现拉）。
+    /// 不缓存清单（桥无状态：每次现拉）。
     fn effective_tools(
         live: Result<Vec<Tool>, String>,
         upstream_version: Option<&str>,
@@ -477,7 +477,7 @@ impl Bridge {
         if args.is_empty() {
             return None;
         }
-        // 清单里没有这个工具 → 不拦：交给上游报 unknown tool（§5 场景 4 增强文案仍在其后生效）
+        // 清单里没有这个工具 → 不拦：交给上游报 unknown tool（unknown tool 增强文案仍在其后生效）
         let tool = tools.iter().find(|t| t.name.as_ref() == name)?;
         let schema = Value::Object(tool.input_schema.as_ref().clone());
         let issues = validate::validate(&schema, &Value::Object(args.clone()));
@@ -495,7 +495,7 @@ impl Bridge {
         Some(self.precheck_error(name, &detail, &schema, source))
     }
 
-    /// 拒绝结果：D6 同形信封（`isError` + message + nextActions）。message 必须点出
+    /// 拒绝结果：与 RimCrow 错误信封同形（`isError` + message + nextActions）。message 必须点出
     /// 「服务端版本较旧 / 该参数未被识别」+ 该工具**当前生效的已知参数列表**（便于改参重试）。
     fn precheck_error(
         &self,
@@ -547,7 +547,7 @@ fn is_transport_closed_marker(err: &McpError) -> bool {
 }
 
 impl ServerHandler for Bridge {
-    /// R1：本地应答，永不依赖上游；instructions/version 取自嵌入快照。
+    /// 本地应答，永不依赖上游；instructions/version 取自嵌入快照。
     fn get_info(&self) -> ServerConfig {
         let snap = snapshot::load();
         let footer = format!(
@@ -564,7 +564,7 @@ impl ServerHandler for Bridge {
             .with_server_info(Implementation::new(snap.server_name.clone(), CRATE_VERSION))
     }
 
-    /// R2 清单双模：探活通过 → 实时透传上游全量清单；否则嵌入快照保底。
+    /// 清单双模：探活通过 → 实时透传上游全量清单；否则嵌入快照保底。
     ///
     /// 上游分页在此合并为单页返回（不下发 cursor，客户端一次性拿全量）。
     async fn list_tools(
@@ -588,7 +588,7 @@ impl ServerHandler for Bridge {
                     }
                 },
                 Err(_) => {
-                    // 连接失败已经打过日志/构造过错误；list 层按 R2 回落快照
+                    // 连接失败已经打过日志/构造过错误；list 层回落嵌入快照
                     tracing::warn!(
                         "tools/list 无法透传上游（attach 失败），回落嵌入快照（{}）：{}",
                         self.version_ctx(),
@@ -609,7 +609,7 @@ impl ServerHandler for Bridge {
         Ok(Self::snapshot_list(snapshot::load()))
     }
 
-    /// R3/R4：探活 → 转发 → 原样回抛；任何不可达都给因果 `isError` + `nextActions[]`。
+    /// 探活 → 转发 → 原样回抛；任何不可达都给因果 `isError` + `nextActions[]`。
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -640,7 +640,7 @@ impl ServerHandler for Bridge {
 
         match peer.call_tool_once(request).await {
             Ok(CallToolResponse::Complete(result)) => {
-                // R3：远端 isError 文案逐字回抛（仅 §5 场景 4 的 unknown tool 例外增强）
+                // 远端 isError 文案逐字回抛（unknown tool 的增强文案是唯一例外）
                 if result.is_error == Some(true) {
                     let text = tool_result_text(&result);
                     if Self::looks_like_unknown_tool(&text) {
@@ -744,7 +744,7 @@ mod tests {
         assert!(instructions.contains(CRATE_VERSION), "must self-report crate version");
         assert!(instructions.contains(&snap.captured_at), "must self-report captured_at");
         assert!(instructions.contains(&snap.instructions), "must carry snapshot instructions");
-        // R9：get_info 不得触发 spawn / 网络（未启用 spawn 时 attempts 恒 0）
+        // get_info 不得触发 spawn / 网络（未启用 spawn 时 attempts 恒 0）
         assert_eq!(bridge.spawn_gate.attempts(), 0);
         assert!(!bridge.spawn_enabled);
     }

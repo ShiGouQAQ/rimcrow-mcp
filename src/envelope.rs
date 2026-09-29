@@ -1,4 +1,7 @@
-//! 错误信封（D6/D14）—— 与 RimCrow `backend/mcp_guard.py::build_error_text` 同形。
+//! 错误信封 —— 与 RimCrow `backend/mcp_guard.py::build_error_text` 同形。
+//!
+//! agent 对一次调用的结果只有一次阅读机会：`message` 必须自足（含因果事实），
+//! `nextActions` 给出可直接执行的自纠动作。
 //!
 //! 产物是**单个合法 JSON 字符串**，作为 MCP `tools/call` 的单个 text 内容返回，
 //! 由调用方包成 `CallToolResult::error(...)`（MCP 侧 `isError:true`）。

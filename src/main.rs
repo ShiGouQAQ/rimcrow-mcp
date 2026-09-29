@@ -12,7 +12,7 @@
 //! - `RIMCROW_SPAWN_CMD` 覆盖 `--spawn` 的拉起命令（开发态/测试用）
 //! - `RIMCROW_MCP_LOG` 日志级别（默认 `info`）
 //!
-//! **R7 stdout 纪律**：stdout 只有 JSON-RPC；tracing 全走 stderr；
+//! **stdout 纪律**：stdout 只有 JSON-RPC；tracing 全走 stderr；
 //! EOF/断连 → 退出码 0；panic → 退出码 1 + stderr 一行，绝不弹窗。
 
 mod bridge;
@@ -36,7 +36,7 @@ use crate::bridge::{Bridge, CRATE_VERSION};
 /// bridge CLI 选项。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Options {
-    /// 未检出 endpoint 时拉起 RimCrow（探活通过绝不二次拉起，D11）。
+    /// 未检出 endpoint 时拉起 RimCrow（探活通过绝不二次拉起）。
     pub spawn: bool,
     /// 拉起时附带 `--browser --no-open`。
     pub headless: bool,
@@ -89,7 +89,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     Ok(Cli::Run(opts))
 }
 
-/// 版本三元组（R8）：crate 版本 + 快照 rimcrow_version + captured_at。
+/// 版本三元组：crate 版本 + 快照 rimcrow_version + captured_at。
 pub fn version_line() -> String {
     let snap = snapshot::load();
     format!(
@@ -98,7 +98,7 @@ pub fn version_line() -> String {
     )
 }
 
-/// R7：panic 收敛为 stderr 一行（不弹任何窗口/对话框）。
+/// panic 收敛为 stderr 一行（不弹任何窗口/对话框）。
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         let payload = info.payload();
