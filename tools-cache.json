@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
   "rimcrow_version": "0.24.7",
-  "captured_at": "2026-09-28T06:39:07.062019+00:00",
+  "captured_at": "2026-09-29T13:57:46.211880+00:00",
   "server_name": "rimcrow-mcp",
-  "instructions": "RimCrow（RimWorld 模组管理器）的 MCP 接口。工具按风险标注只读/写入/高风险（对应 MCP ToolAnnotations 的 readOnlyHint / destructiveHint）。使用约定：\n1. 分页取数——list_mods / get_load_order / read_logs 用 limit+offset（或 filter/keyword）限定范围，避免一次取回全部；响应里 next_offset 非 null 表示还有下一页。\n2. 增量修改——加载顺序一律用 apply_load_order_ops 提交 ops，先 dry_run:true 校验再正式写入；不要「读全量→改→回传全量」。\n3. 并发控制——写入必须带上最近一次响应的 version_token / new_version_token（乐观锁）；不一致会返回冲突，此时重新 get_load_order 取新 token 后重试。\n4. 返回摘要——日志按 list_log_files → read_logs（levels 过滤、tail 取最新）→ get_log_context 逐层缩小范围，不要回传整份文件。\n5. 按固定流程组合——获取依赖：resolve_missing_dependencies → download_workshop_mods → wait_event(\"scan-complete\") → list_mods；排障：search_mod_text 检索模组文件，launch_game 后用 get_game_status / wait_event(\"game-status-changed\") 跟踪再 read_logs 验证；导入排序：parse_load_order 解析 → apply_load_order_ops 写入；贴图转换：get_texture_encoder_status → download_texture_encoder（缺 bin 时）→ start_texture_convert（先 dry_run:true 预演）→ get_texture_convert_tasks 轮询。\nscan_mods、下载等异步操作完成后用 wait_event 等待，或轮询 list_mods / get_download_tasks 确认。",
+  "instructions": "RimCrow（RimWorld 模组管理器）的 MCP 接口。工具按风险标注只读/写入/高风险（对应 MCP ToolAnnotations 的 readOnlyHint / destructiveHint）。使用约定：\n1. 分页取数——list_mods / get_load_order / read_logs 用 limit+offset（或 filter/keyword）限定范围，避免一次取回全部；响应里 next_offset 非 null 表示还有下一页。\n2. 增量修改——加载顺序一律用 apply_load_order_ops 提交 ops，先 dry_run:true 校验再正式写入；不要「读全量→改→回传全量」。\n3. 并发控制——写入必须带上最近一次响应的 version_token / new_version_token（乐观锁）；不一致会返回冲突，此时重新 get_load_order 取新 token 后重试。\n4. 返回摘要——日志按 list_log_files → read_logs（levels 过滤、tail 取最新）→ get_log_context 逐层缩小范围，不要回传整份文件。\n5. 按固定流程组合——获取依赖：resolve_missing_dependencies → download_workshop_mods → wait_event(\"scan-complete\") → list_mods；Git 仓库：github_fetch_repo_info → github_subscribe_repo → github_get_timeline 跟踪部署；排障：search_mod_text 检索模组文件，launch_game 后用 get_game_status / wait_event(\"game-status-changed\") 跟踪再 read_logs 验证；导入排序：parse_load_order 解析 → apply_load_order_ops 写入；贴图转换：get_texture_encoder_status → download_texture_encoder（缺 bin 时）→ start_texture_convert（先 dry_run:true 预演）→ get_texture_convert_tasks 轮询。\nscan_mods、下载等异步操作完成后用 wait_event 等待，或轮询 list_mods / get_download_tasks 确认。",
   "tools": [
     {
       "name": "get_initial_data",
@@ -1377,8 +1377,281 @@
       }
     },
     {
+      "name": "subscribe_workshop_items",
+      "description": "[写] 向 Steam 客户端提交创意工坊订阅（Steamworks ISteamUGC），订阅后由 Steam\n自动下载到工坊目录。前置：Steam 正在运行且已登录——未就绪会返回因果错误，无账号\n的获取走 download_workshop_mods（SteamCMD 匿名下载）。与后者的分工：本工具会把\n模组挂进账号云端订阅列表并随 Steam 自动更新。返回 task_id（task_type=\nsteam-subscribe，可 cancel_task 取消）。下载完成不等于入库：需\nwait_event(\"scan-complete\")（或 scan_mods）→ list_mods 确认。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "workshop_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "workshop_ids"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "unsubscribe_workshop_items",
+      "description": "[写] 向 Steam 客户端提交取消订阅（Steamworks ISteamUGC），解除账号云端订阅\n关系并返回 task_id（task_type=steam-unsubscribe，可 cancel_task 取消）。只退订：\n本地文件去留由 Steam 后续校验决定，重要模组退订前先确认；本地残留面用\nget_residue_overview。前置同 subscribe_workshop_items（Steam 运行且已登录）。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "workshop_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "workshop_ids"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "webapi_subscribe_workshop",
+      "description": "[写] 备用 WebAPI 订阅（IPublishedFileService/Subscribe），不经 Steam 客户端。\n前置：RimCrow 设置已配置 steam_web_api_key（未配置返回因果错误）；普通 Key 能否\n订阅成功由 Steam 判定——主力通路是 subscribe_workshop_items（Steam 客户端），\n无账号的获取走 download_workshop_mods。不自动带依赖，依赖补齐走\nresolve_missing_dependencies。联网操作。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "workshop_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workshop_id"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "webapi_unsubscribe_workshop",
+      "description": "[写] 备用 WebAPI 取消订阅（IPublishedFileService/Unsubscribe），不经 Steam\n客户端。前置：RimCrow 设置已配置 steam_web_api_key；成败同样由 Steam 判定，\n主力通路是 unsubscribe_workshop_items。联网操作。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "workshop_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workshop_id"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "github_fetch_repo_info",
+      "description": "[只读] 解析 Git 仓库信息（provider/host/owner/repo/default_branch/has_release/\nlatest_release_tag/源码分支版本），支持 GitHub 与 GitLab 系（含 gitgud.io）。\nGitHub API 限流或不可用时自动降级网页/本地缓存，结果可能带 fetch_warning（注明\n降级原因）。联网操作，耗时数秒。订阅前用它决定 install_type 与 version：\n无 Release 的仓库用 source（按分支装源码），有 Release 用 release（按 tag 装），\n清单型仓库用 zip。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string"
+          },
+          "source_branch": {
+            "default": "",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "github_subscribe_repo",
+      "description": "[写] 订阅 Git 仓库并立即触发下载部署（订阅＝落监听记录 + 部署，一次完成）。\n先 github_fetch_repo_info 取仓库信息（失败即因果错误，不落订阅），再落库并启动\n部署任务。install_type：source=按分支装源码（source_branch 留空跟随仓库默认\n分支，version 忽略）｜zip=装清单压缩包｜release=装 Release（version 给 tag，\n留空用最新 tag）。模组装进管理器自身 Mod 目录 _GH_<repo>，同名目录会被覆盖。\n返回当前全部订阅记录；上游不透出 task_id，部署进度用 github_get_timeline(url)\n跟踪、进行中任务用 get_download_tasks（取消走 cancel_task(task_type=\"download\")）。\n部署完成≠入库：需 wait_event(\"scan-complete\")（或 scan_mods）→ list_mods 确认。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string"
+          },
+          "install_type": {
+            "default": "source",
+            "enum": [
+              "source",
+              "zip",
+              "release"
+            ],
+            "type": "string"
+          },
+          "source_branch": {
+            "default": "",
+            "type": "string"
+          },
+          "version": {
+            "default": "",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "github_get_subscribed",
+      "description": "[只读] 列出全部 Git 仓库订阅记录（provider/分支/install_type/installed_version/\nlast_sync 与最新时间线摘要）；missing_urls 标出订阅仍在但本地目录已缺失的仓库。\n是 Git 仓库模组的现状总览，更新决策结合 github_fetch_repo_info 的最新版本比对。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "github_trigger_download",
+      "description": "[写] 对已订阅的 Git 仓库重新触发下载与部署（更新版本/换分支/重装），部署\n语义同 github_subscribe_repo 的部署半段，但不改订阅记录。返回 task_id（走\ndownload_mgr，可 cancel_task(task_type=\"download\") 取消）；进度用\ngithub_get_timeline(url) / get_download_tasks 跟踪，装完需扫描入库。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string"
+          },
+          "install_type": {
+            "enum": [
+              "source",
+              "zip",
+              "release"
+            ],
+            "type": "string"
+          },
+          "version": {
+            "default": "",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "install_type"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "github_get_timeline",
+      "description": "[只读] 单个 Git 仓库的本地操作时间线（订阅/下载/解压/部署成功/部署失败/移除/\n本地缺失），是「部署到底成没成」的事实源——get_download_tasks 只反映进行中\n任务，成功与失败的结论以这里为准。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "github_remove_subscription",
+      "description": "[写] 移除 Git 仓库订阅记录（数据库记录 + 时间线标记）。**不删除已安装的模组\n文件**——本地文件删除属批量磁盘变更，不在工具面内；文件是否还在用\nget_residue_overview / list_mods 确认。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "mod_package_prepare_import",
+      "description": "[只读] 预检 RimCrow 模组包（.rimcrowmods.zip）的导入冲突（版本/覆盖/缺失），\n零写入。bundle_path 为模组包绝对路径。预检通过后用 mod_package_import 落地。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "bundle_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "bundle_path"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "mod_package_import",
+      "description": "[写] 启动 RimCrow 模组包（.rimcrowmods.zip）导入任务（解包 → 装入本地 Mods →\n收敛当前档案），返回 task_id（task_type=mod-import，可 cancel_task 取消）；目标\n档案与本地模组目录由上游按当前环境自动补，无需也无法显式指定。建议先跑\nmod_package_prepare_import 预检冲突。完成≠入库：需 wait_event(\"scan-complete\")\n（或 scan_mods）→ list_mods 确认。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "bundle_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "bundle_path"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
       "name": "cancel_task",
-      "description": "[写] 取消一个进行中的后台任务——发起 search_mod_text / 下载 / 扫描这类长任务后\n不必干等。task_type 只接受上游统一取消入口实际路由的 16 种取值（api.py:5711 逐类型\n分派，与前端 cancellableTaskTypes 同集合）：scan｜download｜update｜localize｜\nmod-import｜mod-export｜steamcmd-download｜steamcmd-workshop-repair｜steamcmd-init｜\nsteam-subscribe｜steam-unsubscribe｜steam-workshop-download｜texture-opt｜\ntexture-opt-analyze｜ai-task｜file-search。\ntask_id 取自发起任务的响应（scan_mods 的 data.details.task_id、search_mod_text 与\ndownload_workshop_mods 的 task_id）；仅 task_type=scan 可留空＝取消当前扫描\n（api.py:5731 传 None）。取消是**请求**语义：返回成功只代表已发出请求，不代表任务\n已终止——用 get_download_tasks / wait_event(\"scan-complete\") 复核实际结果。",
+      "description": "[写] 取消一个进行中的后台任务——发起 search_mod_text / 下载 / 扫描这类长任务后\n不必干等。task_type 只接受上游统一取消入口实际路由的 16 种取值（cancel_progress_task 逐类型\n分派，与前端 cancellableTaskTypes 同集合）：scan｜download｜update｜localize｜\nmod-import｜mod-export｜steamcmd-download｜steamcmd-workshop-repair｜steamcmd-init｜\nsteam-subscribe｜steam-unsubscribe｜steam-workshop-download｜texture-opt｜\ntexture-opt-analyze｜ai-task｜file-search。\ntask_id 取自发起任务的响应（scan_mods 的 data.details.task_id、search_mod_text 与\ndownload_workshop_mods 的 task_id）；仅 task_type=scan 可留空＝取消当前扫描\n（cancel_progress_task 的 scan 分支传 None）。取消是**请求**语义：返回成功只代表已发出请求，不代表任务\n已终止——用 get_download_tasks / wait_event(\"scan-complete\") 复核实际结果。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -1420,7 +1693,7 @@
     },
     {
       "name": "read_mod_file",
-      "description": "[只读] 读取单个模组文件的文本内容（search_mod_text 只回匹配行，要看上下文用本\n工具读全文）。path 必须落在当前环境**已知模组根目录内**：DLC / 本地 Mods / 自身\nMods / 工坊 Mods / 工具模组目录，或已扫描到的模组自身路径；含 `..` 的路径与越界\n路径一律拒绝——这不是任意文件读取工具。\n单次最多读 64 KiB：上游 path_read_text_file 的默认上限是 2 MB（api.py:4853 /\nmgr_files.py:626），本工具按工具层输出预算收窄；文件更大时 truncated=true，\nfile_size 仍是完整字节数、content 只到文件开头，超限部分不返回。\n返回 file_path / content / truncated / file_size / encoding / max_bytes；encoding\n为实际使用的解码编码（按 BOM 与内容依次探测）。",
+      "description": "[只读] 读取单个模组文件的文本内容（search_mod_text 只回匹配行，要看上下文用本\n工具读全文）。path 必须落在当前环境**已知模组根目录内**：DLC / 本地 Mods / 自身\nMods / 工坊 Mods / 工具模组目录，或已扫描到的模组自身路径；含 `..` 的路径与越界\n路径一律拒绝——这不是任意文件读取工具。\n单次最多读 64 KiB：上游 path_read_text_file 的默认上限是 2 MB\n（上限定义在 mgr_files.read_text_file 的 max_bytes 默认值），本工具按工具层输出预算收窄；文件更大时 truncated=true，\nfile_size 仍是完整字节数、content 只到文件开头，超限部分不返回。\n返回 file_path / content / truncated / file_size / encoding / max_bytes；encoding\n为实际使用的解码编码（按 BOM 与内容依次探测）。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -1440,7 +1713,7 @@
     },
     {
       "name": "get_workshop_mod_details",
-      "description": "[只读] 按创意工坊物品 ID 批量查详情（标题/作者/预览图/更新时间），一次最多\n100 个（与上游单批在线请求同量级，mgr_steam_api.py:654），更多请分批。ID 取自\nget_residue_overview / trace_install_sources / resolve_missing_dependencies 等返回的\nworkshop_id；上游先规范化（纯数字 6..20 位，非法与重复的直接跳过，\nmgr_steam_api.py:1012）。返回 data = {workshop_id: {workshop_id, package_id, title,\nname, author, preview_url, url, time_updated, detail_source, available}}；\ndetail_source: online=在线命中｜database=仅本地库缓存｜unavailable=两处都没有，\navailable=false 即查不到该 ID。可能联网（Steam GetPublishedFileDetails），在线拿不到\n时自动降级为本地库数据；所有 ID 都无效时 data 为空对象。",
+      "description": "[只读] 按创意工坊物品 ID 批量查详情（标题/作者/预览图/更新时间），一次最多\n100 个（同上游 mgr_steam_api._request_published_file_details 的单批量级），更多请分批。ID 取自\nget_residue_overview / trace_install_sources / resolve_missing_dependencies 等返回的\nworkshop_id；上游先规范化（纯数字 6..20 位，非法与重复的直接跳过，\n见 get_workshop_details）。返回 data = {workshop_id: {workshop_id, package_id, title,\nname, author, preview_url, url, time_updated, detail_source, available}}；\ndetail_source: online=在线命中｜database=仅本地库缓存｜unavailable=两处都没有，\navailable=false 即查不到该 ID。可能联网（Steam GetPublishedFileDetails），在线拿不到\n时自动降级为本地库数据；所有 ID 都无效时 data 为空对象。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
