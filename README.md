@@ -33,7 +33,10 @@ cargo build --release   # 产物 target\release\rimcrow-mcp.exe
 cargo test
 ```
 
-随 RimCrow 发布包分发的 `rimcrow-mcp.exe` 与同批 GUI 一起构建，直接用即可，通常无需自己编译。
+获取途径（二选一）：
+
+- **随 RimCrow fork 安装（推荐）**：fork 发布包内自带 `rimcrow-mcp.exe`（位于 RimCrow 安装目录，如 `apps\RimCrow\`），与同批 GUI 一起构建、版本对齐，装好 RimCrow 即无需单独安装。
+- **从本仓构建**：`cargo build --release` 产出 `target\release\rimcrow-mcp.exe`；编译期把仓内 `tools-cache.json`（由 RimCrow 侧 `scripts/gen_tool_cache.py` 生成的工具快照）嵌入二进制，工具面变化时先重新生成快照再重编译。
 
 接入 MCP 客户端：把本桥注册为 stdio server。以通用 `mcpServers` 配置为例：
 
