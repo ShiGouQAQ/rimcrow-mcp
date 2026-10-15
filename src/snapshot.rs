@@ -1,15 +1,11 @@
 //! 构建期嵌入的工具清单快照（`tools-cache.json`）。
 //!
-//! 快照由 RimCrow 仓库的生成器 `scripts/gen_tool_cache.py` 产出，bridge 侧
-//! 用 `include_str!` 编译期嵌入：发布形态是单个可执行文件，运行期不落任何
-//! 外部清单文件。
+//! 快照由 RimCrow 仓库的生成器从真实工具层导出，手写清单必与实际 schema 走样，
+//! 本文件只解析、不生成。bridge 侧用 `include_str!` 在编译期嵌入，发布形态是
+//! 单个可执行文件，运行期不落任何外部清单文件。
 //!
-//! 工具清单只能由生成器从真实工具层导出——手写清单必与实际 schema 走样，
-//! 本文件只解析、不生成。
-//!
-//! 快照只在两种场合充当真相：
-//! 1. `tools/list` 上游不可达时的保底清单；
-//! 2. `initialize` 的 `instructions` / 版本自报（这两样永远不依赖上游）。
+//! 快照只在两种场合充当真相：tools/list 上游不可达时的保底清单，以及 initialize
+//! 的 instructions 与版本自报（这两样永远不依赖上游）。
 
 use std::sync::OnceLock;
 
@@ -84,7 +80,7 @@ pub fn parse_snapshot(raw: &str) -> Result<Snapshot, String> {
     })
 }
 
-/// 进程内单例读取嵌入快照（`OnceLock`，无跨请求状态义务冲突——快照是构建期常量）。
+/// 进程内单例读取嵌入快照；快照是构建期常量，单例不构成跨请求状态。
 pub fn load() -> &'static Snapshot {
     static SNAPSHOT: OnceLock<Snapshot> = OnceLock::new();
     SNAPSHOT.get_or_init(|| match parse_snapshot(RAW) {
@@ -137,7 +133,7 @@ mod tests {
                 "tool {} must carry an inputSchema",
                 tool.name
             );
-            // 序列化 → 再解析应无损（保证上游/快照两侧 schema 形状同构）
+            // 序列化后重新解析应无损，保证上游与快照两侧的 schema 形状同构
             let json = serde_json::to_value(tool).unwrap();
             let back: rmcp::model::Tool = serde_json::from_value(json).unwrap();
             assert_eq!(back.name, tool.name);

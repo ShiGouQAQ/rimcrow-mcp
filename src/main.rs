@@ -7,10 +7,9 @@
 //!
 //! CLI：`rimcrow-mcp.exe [--spawn] [--spawn-headless] [--version] [--help]`
 //!
-//! env：
-//! - `RIMCROW_MCP_ENDPOINT` 覆盖 endpoint 文件路径
-//! - `RIMCROW_SPAWN_CMD` 覆盖 `--spawn` 的拉起命令（开发态/测试用）
-//! - `RIMCROW_MCP_LOG` 日志级别（默认 `info`）
+//! 环境变量：`RIMCROW_MCP_ENDPOINT` 覆盖 endpoint 文件路径；`RIMCROW_SPAWN_CMD`
+//! 覆盖 `--spawn` 的拉起命令（开发态与测试用）；`RIMCROW_MCP_LOG` 控制日志级别
+//! （默认 `info`）。
 //!
 //! **stdout 纪律**：stdout 只有 JSON-RPC；tracing 全走 stderr；
 //! EOF/断连 → 退出码 0；panic → 退出码 1 + stderr 一行，绝不弹窗。

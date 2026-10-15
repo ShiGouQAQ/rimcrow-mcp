@@ -1,29 +1,32 @@
-//! `tools/call` 参数预校验 —— 只拦「当前生效清单里不存在的参数」（防「假成功」）。
+//! `tools/call` 参数预校验——只拦「当前生效清单里不存在的参数」，防「假成功」。
 //!
-//! 动机（已实测缺陷）：桥的工具清单比运行中的 GUI 新时，新参数会被旧 GUI **静默忽略**
-//! ——不报错，却返回语义完全不同的数据（`list_mods {scope:"active",limit:3}` 在旧 GUI
-//! 返回 `total:2223` 全库结果，`is_active:false` 的条目混在其中）。这类假成功比报错危险，
-//! 故在转发前先由桥拦一道。
+//! 动机是已实测的缺陷：桥的工具清单比运行中的 GUI 新时，新参数会被旧 GUI 静默忽略，
+//! 不报错却返回语义完全不同的数据（list_mods 传 scope:"active" 加 limit:3 时，旧 GUI
+//! 返回全库结果，is_active:false 的条目混在其中）。这类假成功比报错危险，故在转发前
+//! 先由桥拦一道。
 //!
-//! **判定基准与清单双模同源**：live（上游实时 `tools/list`）优先，拿不到才用嵌入快照——
-//! 基准永远是「当前生效的那份清单」，不是写死的快照（谁生效就按谁判）。基准的选取在
-//! `bridge.rs::effective_tools`，本模块只接受「已选好的清单 + 其 inputSchema」。
+//! 判定基准与清单双模同源：上游实时 tools/list 优先，拿不到才用嵌入快照，基准永远是
+//! 当前生效的那份清单而不是写死的快照。基准的选取在 bridge 层完成，本模块只接受
+//! 已选好的清单与其 inputSchema。
 //!
-//! **误杀防护（宁可放过，不可误杀）**：
-//! - 未知键只在 `additionalProperties:false`（且无 `patternProperties`/`propertyNames`，
-//!   两者意味着动态键名）时拦；`true` / 子 schema / 缺省（JSON Schema 默认允许额外属性）
-//!   → 一律放行，按 schema 判定、不一刀切；
-//! - 类型只报**明确不符**：单一 `type`，或 anyOf/oneOf 每一支都有明确 `type` 且全不匹配；
-//!   `allOf`、含自由 schema 的分支、无 `type` → 不判；
-//! - 类型判定按 pydantic 2.x lax（宽松）转换放行服务端会接受的取值——已用 RimCrow 同款
-//!   pydantic 2.12.5 实测：`"5"→5`、`3.0→3`、`true→1`、`"yes"→true` 都是**合法调用**，
-//!   只拦服务端同样会拒绝的取值（`"not-a-number"`、`3.5`、`5` 给 string、`"Active"` 给 enum）；
-//! - 缺省参数（没传的键）零影响：不做 `required` 缺失检查（缺了服务端自己会报）；
-//! - `enum` 只对标量取值比对（对象/数组取值的相等性语义拿不准 → 放过）。
+//! 误杀防护遵循宁可放过、不可误杀。未知键只在 additionalProperties 为 false 且没有
+//! patternProperties 与 propertyNames（两者意味着动态键名）时拦，true、子 schema 与
+//! 缺省形状都按 JSON Schema 默认语义放行额外属性，按 schema 判定、不一刀切。类型只报
+//! 明确不符：单一 type，或 anyOf/oneOf 每一支都有明确 type 且全不匹配；allOf、含自由
+//! schema 的分支、无 type 一概不判。类型判定按 pydantic 2.x lax（宽松）转换放行服务端
+//! 会接受的取值——已用 RimCrow 同款 pydantic 2.12.5 实测，字符串 "5"、浮点 3.0、布尔
+//! true、字符串 "yes" 都是合法调用，只拦服务端同样会拒绝的取值。缺省参数零影响，不做
+//! required 缺失检查，缺了服务端自己会报。enum 只对标量取值比对，对象与数组取值的
+//! 相等性语义拿不准就放过。
 //!
-//! 产物是 `ArgIssue` 列表；错误信封（`isError:true` + message + nextActions，与 RimCrow 错误信封同形）
-//! 由 `bridge.rs::precheck_error` 组装——本模块不产出工具结果，也不引入 `ttlMs`/`cacheScope`
-//! 之类另一客户端(ZCode)的私有字段。
+//! 不引 jsonschema 之类的严格校验器：JSON Schema 按类型字面判定，会把服务端经
+//! pydantic lax 转换后实际接受的取值（如字符串 "5" 传给 integer）误判为非法，
+//! 恰是这里最要防的误杀，故按服务端实际行为自建这套窄判定。
+//!
+//! 产物是 ArgIssue 列表；错误信封（isError:true 加 message 与 nextActions，与 RimCrow
+//! 错误信封同形）由 bridge 层组装，本模块不产出工具结果。ttlMs 与 cacheScope 是 MCP
+//! 2026-07-28 规范对 tools/list 等清单类结果的缓存提示字段，不属于 tools/call 结果，
+//! 错误信封不携带。
 
 use serde_json::{Map, Value};
 
@@ -112,8 +115,9 @@ fn check_object(
     out: &mut Vec<ArgIssue>,
 ) {
     let props = schema.get("properties").and_then(Value::as_object);
-    // 只有显式 additionalProperties:false 才拦未知键；true / 子 schema / 缺省（JSON Schema
-    // 默认允许额外属性）→ 放行。patternProperties / propertyNames 意味着动态键名 → 也放行。
+    // 只有显式 additionalProperties:false 才拦未知键；true、子 schema 与缺省都按
+    // JSON Schema 默认语义放行额外属性。patternProperties 与 propertyNames 意味着
+    // 动态键名，同样放行。
     let forbid_extra = schema.get("additionalProperties") == Some(&Value::Bool(false))
         && schema.get("patternProperties").is_none()
         && schema.get("propertyNames").is_none();
@@ -132,7 +136,7 @@ fn check_object(
                     .map(|p| p.keys().cloned().collect())
                     .unwrap_or_default(),
             }),
-            None => {} // schema 允许额外属性（或没有 properties 可依）→ 放过
+            None => {} // schema 允许额外属性或没有 properties 可依时放过
         }
     }
 }
@@ -140,7 +144,7 @@ fn check_object(
 /// 校验单个取值：类型 → enum → 递归嵌套对象 / 数组元素。
 fn check_value(schema: &Value, value: &Value, path: &str, out: &mut Vec<ArgIssue>) {
     let Some(sub) = schema.as_object() else {
-        return; // 非对象 schema → 拿不准 → 放过
+        return; // 非对象 schema 无从判定，放过
     };
 
     if let Some(expected) = type_conflict(sub, value) {
@@ -152,7 +156,7 @@ fn check_value(schema: &Value, value: &Value, path: &str, out: &mut Vec<ArgIssue
         return; // 类型已不符，不再往下递归
     }
 
-    // enum：标量才比（对象/数组取值拿不准 → 放过）
+    // enum 只比标量，对象与数组取值的相等性语义拿不准，放过
     if !value.is_object() && !value.is_array() {
         if let Some(allowed) = sub.get("enum").and_then(Value::as_array) {
             if !allowed.iter().any(|a| json_eq(a, value)) {
@@ -257,14 +261,14 @@ fn declared_types(v: Option<&Value>) -> Option<Vec<&str>> {
     Some(types)
 }
 
-/// JSON Schema 类型是否匹配（含 pydantic 2.x lax 转换放行；见模块文档「误杀防护」）。
+/// JSON Schema 类型是否匹配；pydantic lax 转换后服务端会接受的取值一律放行。
 fn type_matches(expected: &str, value: &Value) -> bool {
     match expected {
         "string" => value.is_string(),
         "boolean" => match value {
             Value::Bool(_) => true,
             Value::String(s) => pydantic_truthy(s) || pydantic_falsy(s),
-            // pydantic：0/1 → bool（已实测），其余数字拒绝
+            // pydantic lax 只接受 0 与 1 转 bool（已实测），其余数字拒绝
             Value::Number(n) => n.as_f64().is_some_and(|f| f == 0.0 || f == 1.0),
             _ => false,
         },
@@ -277,10 +281,11 @@ fn type_matches(expected: &str, value: &Value) -> bool {
     }
 }
 
-/// 数字类目标匹配（`integer_only` = 只接受整值）。
+/// 数字类目标匹配，integer_only 为真时只接受整值。
 ///
-/// pydantic 2.12.5 实测放行的可转换取值一律通过（误杀防护）：
-/// `true→1`、`"5"→5`、`3.0→3`；明确拒绝的才判冲突：`"not-a-number"`、`3.5`（给 integer）。
+/// pydantic 2.12.5 实测放行的可转换取值一律通过：true 转 1、字符串 "5" 转 5、
+/// 整值浮点 3.0 转 3；服务端明确拒绝的才判冲突，如字符串 "not-a-number" 与
+/// 给 integer 的小数 3.5。
 fn numeric_like(value: &Value, integer_only: bool) -> bool {
     match value {
         Value::Number(n) => {
@@ -293,7 +298,7 @@ fn numeric_like(value: &Value, integer_only: bool) -> bool {
             n.as_f64()
                 .is_some_and(|f| f.is_finite() && f.fract() == 0.0)
         }
-        Value::Bool(_) => true, // pydantic：True → 1
+        Value::Bool(_) => true, // pydantic lax 把 true 当 1
         Value::String(s) => match s.trim().parse::<f64>() {
             Err(_) => false,
             Ok(f) => !integer_only || (f.is_finite() && f.fract() == 0.0),
@@ -387,8 +392,6 @@ mod tests {
         })
     }
 
-    // ---- 必做覆盖 ①：未知参数被拒，且带出已知参数列表 ----
-
     #[test]
     fn unknown_param_rejected_with_known_list() {
         let args = json!({"scope": "active", "limit": 3});
@@ -409,8 +412,6 @@ mod tests {
             vec!["filter", "limit", "offset"]
         );
     }
-
-    // ---- 必做覆盖 ②：合法参数零影响（原样放行 → 透传） ----
 
     #[test]
     fn known_args_pass_with_no_issues() {
@@ -435,8 +436,6 @@ mod tests {
         assert!(validate(&schema, &json!({"filter": "x"})).is_empty());
     }
 
-    // ---- additionalProperties：按 schema 判定，不一刀切 ----
-
     #[test]
     fn additional_properties_true_allows_extra_keys() {
         let schema = json!({
@@ -449,7 +448,7 @@ mod tests {
 
     #[test]
     fn additional_properties_absent_allows_extra_keys() {
-        // JSON Schema 默认允许额外属性 → 缺省不拦（快照 46 个工具全部显式 false，此为防御）
+        // JSON Schema 默认允许额外属性，缺省不拦
         let schema = json!({"type": "object", "properties": {"a": {"type": "integer"}}});
         assert!(validate(&schema, &json!({"bogus": 1})).is_empty());
     }
@@ -482,8 +481,6 @@ mod tests {
         });
         assert!(validate(&schema, &args).is_empty());
     }
-
-    // ---- 递归：嵌套属性与数组元素 ----
 
     #[test]
     fn nested_object_unknown_key_and_type_checked() {
@@ -552,8 +549,6 @@ mod tests {
         );
     }
 
-    // ---- 类型明显不符 → 报；拿不准 → 放过 ----
-
     #[test]
     fn clear_type_mismatch_reported() {
         let schema = json!({"type": "object", "properties": {"filter": {"type": "string"}}});
@@ -618,16 +613,16 @@ mod tests {
             }
         });
         let legal = json!({
-            "limit": "5",        // int("5") → 5
-            "offset": true,      // True → 1
-            "ratio": 3.0,        // 3.0 → 3.0
-            "dry_run": "yes"     // "yes" → true
+            "limit": "5",        // lax 把字符串当整数
+            "offset": true,      // lax 把 true 当 1
+            "ratio": 3.0,        // 整值浮点合法
+            "dry_run": "yes"     // lax 把 "yes" 当 true
         });
         assert!(
             validate(&schema, &legal).is_empty(),
             "legal coercions must pass"
         );
-        // 服务端同样拒绝的取值（pydantic 2.12 实测：3.5 / "x" / 2 均报错）
+        // 服务端同样拒绝的取值（pydantic 2.12 实测：小数 3.5 与字符串 "maybe" 均报错）
         let illegal = json!({"limit": 3.5, "dry_run": "maybe"});
         let issues = validate(&schema, &illegal);
         assert_eq!(issues.len(), 2, "{issues:?}");
@@ -642,8 +637,6 @@ mod tests {
         // 参数为空对象时同样无问题
         assert!(validate(&old_list_mods_schema(), &json!({})).is_empty());
     }
-
-    // ---- enum：只对标量比，数字按数值等价 ----
 
     #[test]
     fn enum_violation_reported_and_compliant_passes() {
@@ -668,12 +661,10 @@ mod tests {
         let schema = json!({"type": "object", "properties": {"n": {"enum": [1, 2]}}});
         assert!(validate(&schema, &json!({"n": 1.0})).is_empty());
         assert_eq!(validate(&schema, &json!({"n": 3})).len(), 1);
-        // 对象/数组取值的 enum → 拿不准 → 放过
+        // 对象与数组取值的 enum 拿不准，放过
         let schema = json!({"type": "object", "properties": {"o": {"enum": [{"a": 1}]}}});
         assert!(validate(&schema, &json!({"o": {"b": 2}})).is_empty());
     }
-
-    // ---- 类型集合 / 展示名 ----
 
     #[test]
     fn type_array_and_unknown_keyword_do_not_flag() {
@@ -681,7 +672,7 @@ mod tests {
         assert!(validate(&schema, &json!({"t": null})).is_empty());
         assert!(validate(&schema, &json!({"t": "x"})).is_empty());
         assert_eq!(validate(&schema, &json!({"t": 5})).len(), 1);
-        // 未知关键字 → 不判定
+        // 未知类型关键字不判定
         let schema = json!({"type": "object", "properties": {"u": {"type": "whatever"}}});
         assert!(validate(&schema, &json!({"u": 5})).is_empty());
     }

@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""最小 Streamable HTTP MCP 上游（**测试替身，不是 RimCrow**）。
+"""最小 Streamable HTTP MCP 上游（测试替身，不是 RimCrow）。
 
-用途：本机 RimCrow 端点在测试窗口未写出时，用它验证 rimcrow-mcp 的**透传路径**：
-bearer 注入、mcp-session-id 会话、tools/list 透传、tools/call 透传、
-远端 isError 逐字回抛、上游 unknown tool 的版本增强（SPEC §5 场景 4）、
-R8 上游/快照版本比对告警。
+用途：本机 RimCrow 端点在测试窗口未写出时，用它验证 rimcrow-mcp 的透传路径：
+bearer 注入、mcp-session-id 会话、tools/list 透传、tools/call 透传、远端 isError
+逐字回抛、上游未知工具的版本增强文案、上游与快照的版本比对告警。
 
-启动后把 endpoint 文件（schema_version=1）写到 --endpoint 指定路径，
-自身进程名必须落在探活白名单（python.exe）内。
+启动后把 endpoint 文件（schema_version=1）写到 --endpoint 指定路径，自身进程名
+必须落在探活白名单（python.exe）内。
 
-为什么不用 rmcp 自带的 server（feature ``transport-streamable-http-server`` /
-``StreamableHttpService``；本 crate ``Cargo.toml`` 只启用 client 侧，未开该 feature）：
-
-1. 要写 **RimCrow endpoint 文件契约**（``schema_version=1``、``started_at`` 落在探活
-   窗口内、进程名进白名单），rmcp 的传输层不认这套文件契约；
-2. 要**精确制造**异常样本：上游版本固定 ``9.9.9``（≠ 快照 → 触发 R8 版本错配告警）、
-   固定远端 isError 文本、未知会话回 404（复现 FastMCP 同样的 404 → 触发 transport
-   的 session recovery）、未知工具 → §5-S4 增强文案；
-3. 替身与被测桥（rmcp）必须是**两套独立实现**，用 rmcp 写上游等于「拿 rmcp 测 rmcp」；
-4. Python 标准库零依赖（``http.server`` / ``json`` / ``threading``），由
-   ``scripts/smoke_bridge.py --fake`` 以 ``sys.executable`` 直接拉起。
+不用 rmcp 自带的 server（feature transport-streamable-http-server /
+StreamableHttpService；本 crate Cargo.toml 只启用 client 侧，未开该 feature），
+原因：要写 RimCrow 的 endpoint 文件契约（schema_version=1、started_at 落在探活
+窗口内、进程名进白名单），rmcp 的传输层不认这套文件契约；要精确制造异常样本
+（上游版本固定 9.9.9 以触发版本错配告警、固定远端 isError 文本、未知会话回 404
+以复现 FastMCP 同样的会话恢复行为、未知工具触发增强文案）；替身与被测桥必须是
+两套独立实现，用 rmcp 写上游等于拿 rmcp 测 rmcp；且 Python 标准库零依赖，可被
+冒烟脚本以 sys.executable 直接拉起。
 """
 from __future__ import annotations
 
@@ -68,7 +64,7 @@ FAKE_TOOLS = [
     },
 ]
 
-SERVER_VERSION = "9.9.9"  # 故意 ≠ 快照 0.24.7，用来触发 R8 版本错配告警
+SERVER_VERSION = "9.9.9"  # 故意与快照版本不同，触发版本错配告警
 REMOTE_ERROR_TEXT = "REMOTE_FAILURE: disk is read-only (fixed upstream text)"
 
 
@@ -83,7 +79,6 @@ class Handler(BaseHTTPRequestHandler):
         if self.log_enabled:
             sys.stderr.write("[fake-upstream] " + (fmt % args) + "\n")
 
-    # ---------- helpers ----------
     def _bearer_ok(self) -> bool:
         auth = self.headers.get("Authorization", "")
         return auth == f"Bearer {self.token}"
@@ -114,7 +109,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    # ---------- verbs ----------
     def do_GET(self):  # noqa: N802
         # 无 server-push 流：按规范回 405
         self.send_response(405)
@@ -195,7 +189,7 @@ class Handler(BaseHTTPRequestHandler):
                     "isError": True,
                 }
             else:
-                # 触发 bridge 的 §5 场景 4 增强
+                # 触发 bridge 对未知工具的版本增强文案
                 result = {
                     "content": [{"type": "text", "text": f"Unknown tool: {name}"}],
                     "isError": True,
@@ -236,7 +230,7 @@ def main() -> int:
         "url": f"http://127.0.0.1:{args.port}/mcp",
         "pid": os.getpid(),
         "token": args.token,
-        # 立刻写出：started_at 落在 [create-5s, create+300s] 内 → 探活 ready
+        # started_at 写当前时间，落在探活允许的时间窗口内，探活判 ready
         "started_at": datetime.now().astimezone().isoformat(),
         "mode": "desktop",
     }

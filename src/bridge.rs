@@ -5,20 +5,21 @@
 //! MCP 客户端 --stdio--> rimcrow-mcp --Streamable HTTP--> RimCrow GUI 内嵌端点
 //! ```
 //!
-//! 行为准则：
-//! - `initialize` 永不依赖上游：本地应答，instructions / version 来自嵌入快照。
-//! - `tools/list` 透传优先：endpoint 探活通过 → 每次实时转发上游全量清单；
-//!   不可达 → 嵌入快照全量应答。
-//! - `tools/call` 探活 → HTTP 转发（注入 bearer，`mcp-session-id` 由 rmcp
-//!   transport 维护并逐请求携带）→ 远端 `isError` 结果**逐字回抛**。
-//! - endpoint 缺失 / pid 过期 → `isError:true` + 因果文案 + `nextActions[]`。
-//! - 探活通过绝不二次拉起；`--spawn` 只在未检出 endpoint 时拉起。
-//! - 版本自报三元组 + attach 后上游/快照版本比对（stderr 警告一行）。
-//! - 桥无状态：进程内只持有「endpoint 路径 / 上游会话」，不缓存清单。
-//! - 参数预校验（防「假成功」）：`tools/call` 转发前，把调用参数对照
-//!   「当前生效清单」（**live 优先、拿不到才用嵌入快照**）拦一道——schema 未
-//!   声明的参数 / 明显类型不符 / enum 越界 → `isError:true` + 因果文案 + 已知参数列表；
-//!   未知工具、空参数、合法参数一律零影响，原样转发（规则与误杀防护见 `validate.rs`）。
+//! 行为约定：
+//!
+//! initialize 永不依赖上游，本地应答，instructions 与版本自报取自嵌入快照。
+//! tools/list 透传优先：endpoint 探活通过时每次实时转发上游全量清单，不可达时
+//! 以嵌入快照全量应答。tools/call 先探活再转发，bearer 由 rmcp transport 注入，
+//! mcp-session-id 由 transport 维护并逐请求携带，远端 isError 结果逐字回抛。
+//! endpoint 缺失或 pid 过期时返回 isError:true，附因果文案与 nextActions 列表。
+//! 探活通过绝不二次拉起，--spawn 只在未检出 endpoint 时拉起。桥自报版本三元组，
+//! attach 成功后与上游 serverInfo.version 比对，不一致时向 stderr 输出一行警告。
+//! 桥无状态：进程内只持有 endpoint 路径与上游会话，不缓存清单。
+//!
+//! 参数预校验防「假成功」：tools/call 转发前把调用参数对照当前生效清单（live 优先，
+//! 拿不到才用嵌入快照）拦一道，schema 未声明的参数、明显类型不符、enum 越界都以
+//! isError:true 加因果文案与已知参数列表拒绝；未知工具、空参数、合法参数一律零影响
+//! 原样转发，拦截规则宁可放过不可误杀。
 
 use std::borrow::Cow;
 use std::path::PathBuf;
@@ -28,9 +29,9 @@ use std::time::Duration;
 use serde_json::{Map, Value};
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ClientCapabilities, ClientConfig,
-    ContentBlock, Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
-    ServerConfig, Tool,
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ClientCapabilities,
+    ClientConfig, ContentBlock, Implementation, ListToolsResult, PaginatedRequestParams,
+    ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::{Peer, RequestContext, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
@@ -48,7 +49,7 @@ pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 建立上游会话的超时。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// `tools/list` 透传超时（超时 → 回落快照，不阻塞客户端）。
+/// `tools/list` 透传超时；超时按上游不可达处理，回落嵌入快照，不阻塞客户端。
 const LIST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 上游会话缓存键分隔符（url + token，二者任一变化即重建会话）。
@@ -60,7 +61,7 @@ struct Upstream {
     svc: RunningService<RoleClient, ClientConfig>,
 }
 
-/// `--spawn` 闸门：每个 bridge 进程至多拉起一次（`OnceCell` = 防重入）。
+/// `--spawn` 闸门：保证每个 bridge 进程至多发起一次拉起尝试，重复调用复用首次结果。
 pub struct SpawnGate {
     endpoint_path: PathBuf,
     headless: bool,
@@ -80,7 +81,7 @@ impl SpawnGate {
         })
     }
 
-    /// 确保 endpoint 可用；未启用 spawn 时恒返回未尝试。
+    /// 确保 endpoint 可用；未启用 spawn 时不做任何尝试，直接返回禁用错误。
     async fn ensure(&self) -> Result<(), String> {
         if !self.enabled {
             return Err(OK_DISABLED.to_string());
@@ -146,7 +147,8 @@ impl Bridge {
         ))])
     }
 
-    /// 由探活结果构造降级错误（因果 + nextActions，禁空洞 timeout 文案）。
+    /// 由探活结果构造降级错误：message 写明原因与当前版本，nextActions 给出可执行
+    /// 动作，不使用空洞的超时措辞。
     fn degraded_for_probe(&self, out: &ProbeOutcome, spawn_note: Option<&str>) -> CallToolResult {
         let mut actions: Vec<String> = Vec::new();
 
@@ -274,7 +276,7 @@ impl Bridge {
                 Ok(svc) => svc,
                 Err(e) => return Err(self.degraded_connect(&e)),
             };
-            // 成功 attach 后比对快照版本与上游 serverInfo.version，不一致 → stderr 一行
+            // 成功 attach 后比对快照版本与上游 serverInfo.version，不一致时向 stderr 输出一行警告
             if let Some(peer_info) = svc.peer_info() {
                 if let Some(impl_info) = &peer_info.server_info {
                     let snap = snapshot::load();
@@ -328,10 +330,23 @@ impl Bridge {
 
     /// 嵌入快照 → `tools/list` 结果（上游不可达时的保底清单）。
     fn snapshot_list(snap: &Snapshot) -> ListToolsResult {
+        Self::list_result(snap.tools.clone())
+    }
+
+    /// 清单结果的统一出口，按 MCP 2026-07-28 方言自报缓存提示（该方言把这两个字段
+    /// 列为清单类结果的必填项，rmcp 里它们是 `Option`，缺省时整个字段从序列化产物
+    /// 消失，新版客户端会按缺必填拒收）。
+    ///
+    /// `ttlMs: 0` 表示清单立即过期，客户端每次现取，与「清单真相在上游、桥不缓存」
+    /// 的定位一致。`cacheScope: "private"` 表示工具面随本机档案与 GUI 版本变化，属
+    /// 用户特定数据，不进跨用户共享缓存。
+    fn list_result(tools: Vec<Tool>) -> ListToolsResult {
         ListToolsResult {
-            tools: snap.tools.clone(),
+            tools,
             ..Default::default()
         }
+        .with_ttl_ms(0)
+        .with_cache_scope(CacheScope::Private)
     }
 
     /// 上游 `tools/list` 全量拉取（分页由 rmcp `list_all_tools` 处理）。
@@ -366,7 +381,7 @@ impl Bridge {
                 && (lower.contains("not found") || lower.contains("不存在")))
     }
 
-    /// 新桥 × 旧 GUI 的 unknown tool：上游报未知工具时改为增强文案（必须点出两侧版本）。
+    /// 上游报未知工具时的增强文案：点出两侧版本，说明新桥可能超前于运行中的 GUI。
     fn enriched_unknown_tool(
         &self,
         name: &str,
@@ -390,7 +405,8 @@ impl Bridge {
         Self::error_result(&message, actions)
     }
 
-    /// 上游协议错误 → 可读的 isError（agent 对一次调用的结果只有一次阅读机会，文案必须自足）。
+    /// 上游协议错误转成可读的 isError：agent 对一次调用的结果只有一次阅读机会，
+    /// 文案必须自足。
     fn upstream_protocol_error(&self, err: &McpError, name: &str) -> CallToolResult {
         let message = format!("{}（上游 JSON-RPC code={}）", err.message, err.code.0);
         let actions = vec![
@@ -401,7 +417,7 @@ impl Bridge {
         Self::error_result(&message, actions)
     }
 
-    /// 传输层失败 → 因果降级（禁止空洞 timeout 文案）。
+    /// 传输层失败的因果降级：说明上游失去响应与当前版本，nextActions 给出自纠动作。
     fn upstream_transport_error(&self, err: &ServiceError) -> CallToolResult {
         let message = format!(
             "上游端点在转发期间失去响应：{err}；当前无法完成 tools/call（{}）",
@@ -415,13 +431,9 @@ impl Bridge {
         Self::error_result(&message, actions)
     }
 
-    // ---- 参数预校验（防「假成功」：新参数被旧 GUI 静默忽略） ----
-
-    /// 当前生效清单：live（上游实时 `tools/list`）优先，拿不到才用嵌入快照——
-    /// 校验基准永远是「当前生效的那份清单」，不是写死的快照。
-    ///
-    /// 返回 `(清单, 来源描述)`；来源描述会进错误文案，点出判据来自谁（live ≠ 快照时不至于误读）。
-    /// 不缓存清单（桥无状态：每次现拉）。
+    /// 当前生效清单：优先取上游实时 tools/list，取不到时回退嵌入快照；校验基准永远
+    /// 是当前生效的那份清单，不是写死的快照。返回清单与来源描述，来源描述进错误文案，
+    /// 便于分辨判据来自实时清单还是快照。清单不缓存，每次现拉。
     fn effective_tools(
         live: Result<Vec<Tool>, String>,
         upstream_version: Option<&str>,
@@ -448,9 +460,10 @@ impl Bridge {
         }
     }
 
-    /// 参数预校验：现拉「当前生效清单」（live 优先 / 快照兜底）→ 逐参数对照该工具 inputSchema。
+    /// 参数预校验：现拉当前生效清单（live 优先、快照兜底），逐参数对照该工具 inputSchema。
     ///
-    /// 返回 `None` = 放行（原样转发，调用参数一字不改）；`Some` = 拒绝结果（`isError` 信封）。
+    /// 返回 `None` 表示放行，调用参数一字不改原样转发；返回 `Some` 是 isError 信封
+    /// 形式的拒绝结果。
     async fn precheck(
         &self,
         name: &str,
@@ -477,7 +490,7 @@ impl Bridge {
         if args.is_empty() {
             return None;
         }
-        // 清单里没有这个工具 → 不拦：交给上游报 unknown tool（unknown tool 增强文案仍在其后生效）
+        // 清单里没有这个工具时不拦，交给上游报未知工具，随后的增强文案仍然生效
         let tool = tools.iter().find(|t| t.name.as_ref() == name)?;
         let schema = Value::Object(tool.input_schema.as_ref().clone());
         let issues = validate::validate(&schema, &Value::Object(args.clone()));
@@ -495,8 +508,9 @@ impl Bridge {
         Some(self.precheck_error(name, &detail, &schema, source))
     }
 
-    /// 拒绝结果：与 RimCrow 错误信封同形（`isError` + message + nextActions）。message 必须点出
-    /// 「服务端版本较旧 / 该参数未被识别」+ 该工具**当前生效的已知参数列表**（便于改参重试）。
+    /// 拒绝结果与 RimCrow 错误信封同形（isError 加 message 与 nextActions）。message
+    /// 写明哪些参数未被识别、服务端版本可能较旧，并列出该工具当前生效的已知参数，
+    /// 便于改参重试。
     fn precheck_error(
         &self,
         name: &str,
@@ -538,7 +552,19 @@ fn tool_result_text(result: &CallToolResult) -> String {
     out
 }
 
-/// 上游错误是否是「传输已断」标记（rmcp 的 `is_transport_closed` 是 pub(crate）。
+/// 补齐调用结果的 `resultType` 字段。MCP 2026-07-28 方言把该字段列为所有调用结果
+/// 的必填项；上游是旧方言时结果线形里没有它，反序列化后为 `None`，新版客户端会因
+/// 缺必填整单拒收。能走到透传的 Complete 在语义上就是完整结果（task 与
+/// input_required 形态都已被上游拦截改造），补 `"complete"` 恒正确；旧方言对端由
+/// rmcp 在响应层自动剥掉该字段，两种方言都成立。已带值的结果保持原样。
+fn ensure_result_type(result: &mut CallToolResult) {
+    if result.result_type.is_none() {
+        result.result_type = Some(rmcp::model::ResultType::COMPLETE);
+    }
+}
+
+/// 判断上游错误是否是 rmcp 的「传输已断」标记；rmcp 自带的同类判断方法未公开，
+/// 这里按错误数据里的键名识别。
 fn is_transport_closed_marker(err: &McpError) -> bool {
     err.data
         .as_ref()
@@ -564,9 +590,9 @@ impl ServerHandler for Bridge {
             .with_server_info(Implementation::new(snap.server_name.clone(), CRATE_VERSION))
     }
 
-    /// 清单双模：探活通过 → 实时透传上游全量清单；否则嵌入快照保底。
+    /// 清单双模：探活通过时实时透传上游全量清单，否则以嵌入快照保底。
     ///
-    /// 上游分页在此合并为单页返回（不下发 cursor，客户端一次性拿全量）。
+    /// 上游分页在此合并为单页返回，不下发 cursor，客户端一次性拿全量。
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -578,10 +604,7 @@ impl ServerHandler for Bridge {
                 Ok((peer, _)) => match self.upstream_list(&peer).await {
                     Ok(tools) => {
                         tracing::debug!("tools/list 透传上游：{} 个工具", tools.len());
-                        return Ok(ListToolsResult {
-                            tools,
-                            ..Default::default()
-                        });
+                        return Ok(Self::list_result(tools));
                     }
                     Err(e) => {
                         tracing::warn!("tools/list 透传失败，回落嵌入快照：{e}");
@@ -609,7 +632,7 @@ impl ServerHandler for Bridge {
         Ok(Self::snapshot_list(snapshot::load()))
     }
 
-    /// 探活 → 转发 → 原样回抛；任何不可达都给因果 `isError` + `nextActions[]`。
+    /// 探活后转发并原样回抛；任何不可达都以因果 isError 加 nextActions 降级。
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -627,8 +650,8 @@ impl ServerHandler for Bridge {
             Err(degraded) => return Ok(degraded.into()),
         };
 
-        // 参数预校验（防「假成功」）：调用带参数时，先按当前生效清单拦下会被旧 GUI
-        // 静默忽略的参数（live 优先、拿不到 live 回退快照）；合法/空参数零影响照原样转发。
+        // 参数预校验防「假成功」：调用带参数时，先按当前生效清单拦下会被旧 GUI
+        // 静默忽略的参数；合法与空参数零影响，照原样转发。
         if let Some(args) = request.arguments.as_ref() {
             if let Some(rejected) = self
                 .precheck(&name, args, &peer, upstream_version.as_deref())
@@ -639,7 +662,7 @@ impl ServerHandler for Bridge {
         }
 
         match peer.call_tool_once(request).await {
-            Ok(CallToolResponse::Complete(result)) => {
+            Ok(CallToolResponse::Complete(mut result)) => {
                 // 远端 isError 文案逐字回抛（unknown tool 的增强文案是唯一例外）
                 if result.is_error == Some(true) {
                     let text = tool_result_text(&result);
@@ -653,6 +676,7 @@ impl ServerHandler for Bridge {
                             .into());
                     }
                 }
+                ensure_result_type(&mut result);
                 Ok(result.into())
             }
             Ok(CallToolResponse::InputRequired(_)) => {
@@ -719,6 +743,23 @@ mod tests {
         assert!(!Bridge::looks_like_unknown_tool("ok"));
     }
 
+    /// 上游旧方言的结果线形没有 resultType，反序列化后为 None；
+    /// 补齐后线形必含 `resultType: "complete"`。
+    #[test]
+    fn complete_passthrough_gets_result_type_for_modern_peers() {
+        let raw = json!({"content": [{"type": "text", "text": "ok"}], "isError": false});
+        let mut result: CallToolResult = serde_json::from_value(raw).unwrap();
+        assert_eq!(result.result_type, None);
+        ensure_result_type(&mut result);
+        assert_eq!(result.result_type, Some(rmcp::model::ResultType::COMPLETE));
+        let line = serde_json::to_value(&result).unwrap();
+        assert_eq!(line["resultType"], "complete");
+        // 已带值的结果不被改写
+        let mut errored = CallToolResult::error(vec![]);
+        ensure_result_type(&mut errored);
+        assert_eq!(errored.result_type, Some(rmcp::model::ResultType::COMPLETE));
+    }
+
     #[test]
     fn snapshot_list_carries_every_tool_without_cursor() {
         let snap = snapshot::load();
@@ -726,6 +767,12 @@ mod tests {
         assert_eq!(list.tools.len(), snap.tools.len());
         assert!(list.next_cursor.is_none());
         assert_eq!(list.result_type, Some(rmcp::model::ResultType::COMPLETE));
+        // 新版方言必填的缓存提示字段：结构里在，线形里也在（缺省时序列化整个省略）
+        assert_eq!(list.ttl_ms, Some(0));
+        assert_eq!(list.cache_scope, Some(rmcp::model::CacheScope::Private));
+        let json = serde_json::to_value(&list).unwrap();
+        assert_eq!(json["ttlMs"], 0);
+        assert_eq!(json["cacheScope"], "private");
     }
 
     #[test]
@@ -744,7 +791,7 @@ mod tests {
         assert!(instructions.contains(CRATE_VERSION), "must self-report crate version");
         assert!(instructions.contains(&snap.captured_at), "must self-report captured_at");
         assert!(instructions.contains(&snap.instructions), "must carry snapshot instructions");
-        // get_info 不得触发 spawn / 网络（未启用 spawn 时 attempts 恒 0）
+        // get_info 不触发 spawn 与网络：未启用 spawn 时尝试计数恒为零
         assert_eq!(bridge.spawn_gate.attempts(), 0);
         assert!(!bridge.spawn_enabled);
     }
@@ -831,8 +878,6 @@ mod tests {
         });
     }
 
-    // ---- 参数预校验（防「假成功」） ----
-
     /// 造一个最小工具（`rmcp::model::Tool` 是 `#[non_exhaustive]`，只能反序列化构造）。
     fn tool_named(name: &str) -> Tool {
         serde_json::from_value(json!({"name": name, "inputSchema": {"type": "object"}}))
@@ -870,14 +915,14 @@ mod tests {
         assert!(source.contains(&snap.rimcrow_version), "{source}");
     }
 
-    /// 必做覆盖 ①（bridge 层）：未知参数被拒，且文案带出生效清单的已知参数列表。
+    /// 未知参数在 bridge 层被拒，文案带出当前生效清单的已知参数列表。
     #[test]
     fn precheck_rejects_unknown_arg_and_lists_known_params() {
         let bridge = bridge_for_test();
         let snap = snapshot::load();
         let args: Map<String, Value> =
             serde_json::from_value(json!({"definitely_bogus": 1, "limit": 3})).unwrap();
-        // 无 live 清单 → 直接喂快照清单（= 回退态仍能校验，见 effective_tools_falls_back_…）
+        // 无 live 清单时直接喂快照清单，即回退态仍然能校验
         let source = "桥内嵌快照 RimCrow 0.24.7 @ 2026-09-27（上游 tools/list 不可用）";
         let result = bridge
             .precheck_with("list_mods", &args, &snap.tools, source)
@@ -889,7 +934,8 @@ mod tests {
         );
 
         let text = tool_result_text(&result);
-        // ZCode 私有字段（另一客户端的工具结果字段）不得引入
+        // 缓存提示字段只出现在 tools/list 等清单类结果上，
+        // 工具调用的错误信封不得携带 ttlMs 与 cacheScope
         assert!(
             !text.contains("ttlMs") && !text.contains("cacheScope"),
             "{text}"
@@ -903,7 +949,7 @@ mod tests {
         assert!(msg.contains("未被识别"), "{msg}");
         assert!(msg.contains("版本较旧"), "{msg}");
         assert!(msg.contains(source), "文案要说明清单来源：{msg}");
-        // 已知参数列表必须来自生效清单的 inputSchema（逐个出现，便于改参重试）
+        // 已知参数逐个出现在文案里，便于改参重试
         let schema = Value::Object(
             snap.tools
                 .iter()
@@ -918,14 +964,14 @@ mod tests {
         for k in &known {
             assert!(msg.contains(k), "已知参数 {k} 未出现在文案：{msg}");
         }
-        // 两侧版本点名（既有错误风格）
+        // 文案同时点出桥与快照两侧版本
         assert!(msg.contains(CRATE_VERSION), "{msg}");
         assert!(msg.contains(&snap.rimcrow_version), "{msg}");
         let actions = v["nextActions"].as_array().expect("nextActions");
         assert!(actions.len() >= 2, "{actions:?}");
     }
 
-    /// 必做覆盖 ②：合法参数零影响（放行 → 原样透传），空参数/未知工具也不拦。
+    /// 合法参数零影响，放行后原样透传；空参数与未知工具同样不拦。
     #[test]
     fn precheck_passes_known_args_for_passthrough() {
         let bridge = bridge_for_test();
@@ -938,12 +984,12 @@ mod tests {
                 .is_none(),
             "已知参数必须原样放行"
         );
-        // 空参数 → 不拦（连清单都不必拉，见 precheck 的早退）
+        // 空参数不拦，precheck 在拉清单之前就会早退
         let empty = Map::new();
         assert!(bridge
             .precheck_with("list_mods", &empty, &snap.tools, "测试")
             .is_none());
-        // 清单里没有的工具 → 不拦（交给上游 unknown tool 增强文案）
+        // 清单里没有的工具不拦，交给上游报未知工具后走增强文案
         assert!(bridge
             .precheck_with("__nope__", &args, &snap.tools, "测试")
             .is_none());

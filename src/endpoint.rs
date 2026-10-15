@@ -1,14 +1,13 @@
 //! endpoint 文件的结构约定（schema_version=1）与探活。
 //!
-//! 与 RimCrow `backend/mcp_endpoint.py::probe_endpoint` **语义等价**：
-//! - 路径：env `RIMCROW_MCP_ENDPOINT` 覆盖 → `%LOCALAPPDATA%\RimCrow\mcp-endpoint.json`
-//! - 状态：`missing` / `stale`（含 schema、url、pid、进程名、启动时间细分）/ `ready`
-//! - pid 二次校验：进程存活 **且** 进程名在白名单 **且**
-//!   `started_at ∈ [create_time - CLOCK_SKEW, create_time + MAX_BOOT]`
-//!   （Windows pid 会复用，启动时间比对才是主防线）
-//! - 进程信息用成熟库 `sysinfo` 获取（进程名 / 启动时间），不自己造轮子。
+//! 探活语义与 RimCrow 后端逐条等价。路径可用环境变量 RIMCROW_MCP_ENDPOINT 覆盖，
+//! 缺省落在 %LOCALAPPDATA%\RimCrow\mcp-endpoint.json。状态分三档：missing、
+//! stale（含 schema、url、pid、进程名、启动时间等细分原因）与 ready。pid 做二次
+//! 校验：进程存活、进程名在白名单内、且 endpoint 的 started_at 落在进程创建时间
+//! 附近的允许窗口内；Windows 的 pid 会复用，启动时间比对才是防冒名的主防线。
+//! 进程名与启动时间通过成熟库 sysinfo 获取，不自造轮子。
 //!
-//! `reason` 是给 agent 看的因果陈述（含路径与 pid 事实），直接进降级错误文案。
+//! reason 是给 agent 看的因果陈述，包含路径与 pid 等事实，直接进降级错误文案。
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -25,7 +24,7 @@ pub const CLOCK_SKEW: f64 = 5.0;
 /// `started_at` 与进程 `create_time` 允许的上界偏差（秒，endpoint 写出距进程启动的上限）。
 pub const MAX_BOOT: f64 = 300.0;
 
-/// loopback 前缀（Python 侧 `str.startswith("http://127.0.0.1:")`）。
+/// endpoint url 必须以该 loopback 前缀开头，防止被诱导连接外部地址。
 pub const LOOPBACK_PREFIX: &str = "http://127.0.0.1:";
 
 /// endpoint 文件的结构化形态。
@@ -38,13 +37,13 @@ pub struct EndpointInfo {
     pub started_at: String,
     #[serde(default)]
     pub mode: String,
-    /// 缺失 / null → `None`，读出时按 0 处理（对齐 Python `raw.get(...) or 0`）。
+    /// 缺失或 null 时读作 None，随后按 schema 版本 0 处理，与后端行为一致。
     #[serde(default)]
     pub schema_version: Option<i64>,
 }
 
 impl EndpointInfo {
-    /// schema 版本读数（缺失按 0，与 Python 一致）。
+    /// schema 版本读数，缺失按 0 处理。
     pub fn schema(&self) -> i64 {
         self.schema_version.unwrap_or(0)
     }
@@ -87,10 +86,8 @@ impl ProbeOutcome {
 }
 
 /// 探活允许的进程名集合（小写，BTreeSet 保证 `join("/")` 输出顺序稳定）。
-///
-/// - `rimcrow.exe`：打包主程序名（`pack_pyinstaller.py` 的 APP_NAME）
-/// - `python.exe` / `pythonw.exe`：开发态 GUI 与 dev attach（对齐 Python 侧
-///   `Path(sys.executable).name`；Windows 下同一份代码可能是 `python.exe` 或 `pythonw.exe`）
+/// rimcrow.exe 是打包主程序名；python.exe 与 pythonw.exe 覆盖开发态 GUI 与
+/// dev attach，同一份后端代码在 Windows 下可能以两者之一运行。
 pub fn default_allowed_names() -> BTreeSet<String> {
     ["rimcrow.exe", "python.exe", "pythonw.exe"]
         .iter()
@@ -111,7 +108,7 @@ pub fn default_endpoint_path() -> PathBuf {
         .ok()
         .filter(|p| !p.as_os_str().is_empty())
         .or_else(|| {
-            // 对齐 Python `Path.home()`（Windows = USERPROFILE，兜底 HOME）
+            // 兜底顺序与后端一致：Windows 取 USERPROFILE，再退 HOME
             std::env::var("USERPROFILE")
                 .ok()
                 .map(PathBuf::from)
@@ -121,10 +118,10 @@ pub fn default_endpoint_path() -> PathBuf {
     base.join("RimCrow").join("mcp-endpoint.json")
 }
 
-/// 只读解析 endpoint 文件（不做进程探活）。
+/// 只读解析 endpoint 文件，不做进程探活。
 ///
-/// `Ok(None)` = 文件不存在；`Err(String)` = 损坏 / 字段缺失。
-/// 单测直接消费；`probe` 内联了同逻辑以便区分 NotFound / 读取失败。
+/// `Ok(None)` 表示文件不存在；`Err(String)` 表示损坏或字段缺失。
+/// 单测直接消费；`probe` 内联了同样的读取逻辑，以便区分文件不存在与读取失败。
 #[allow(dead_code)]
 pub fn read_endpoint(path: &Path) -> Result<Option<EndpointInfo>, String> {
     let raw = match std::fs::read_to_string(path) {
@@ -138,9 +135,7 @@ pub fn read_endpoint(path: &Path) -> Result<Option<EndpointInfo>, String> {
     }
 }
 
-/// 探活：返回 `ProbeOutcome`（状态 + 因果 reason + path）。
-///
-/// `allowed` 为进程名白名单（小写）。语义与 `mcp_endpoint.probe_endpoint` 逐条对应。
+/// 探活：返回状态、因果 reason 与 endpoint 路径；allowed 为小写进程名白名单。
 pub fn probe(path: &Path, allowed: &BTreeSet<String>) -> ProbeOutcome {
     let raw = match std::fs::read_to_string(path) {
         Ok(s) => s,
@@ -181,7 +176,7 @@ pub fn probe(path: &Path, allowed: &BTreeSet<String>) -> ProbeOutcome {
         path: path.to_path_buf(),
     };
 
-    // 1) schema 版本
+    // schema 版本先于其它检查：不匹配直接进专门分支，给固定文案
     if info.schema() != SCHEMA_VERSION {
         return outcome(
             ProbeStatus::UnsupportedSchema(info.schema()),
@@ -195,7 +190,7 @@ pub fn probe(path: &Path, allowed: &BTreeSet<String>) -> ProbeOutcome {
         );
     }
 
-    // 2) url 必须是 loopback（防止被诱导连到外部地址）
+    // url 必须是 loopback，防止被诱导连接外部地址
     if !info.url.starts_with(LOOPBACK_PREFIX) {
         return outcome(
             ProbeStatus::Stale,
@@ -204,7 +199,7 @@ pub fn probe(path: &Path, allowed: &BTreeSet<String>) -> ProbeOutcome {
         );
     }
 
-    // 3) pid 存活 + 进程名白名单 + 启动时间比对
+    // pid 三道校验：进程存活、进程名白名单、启动时间窗口
     let pid = Pid::from_u32(info.pid);
     let mut system = System::new();
     system.refresh_processes_specifics(
@@ -279,13 +274,13 @@ pub fn probe_default(path: &Path) -> ProbeOutcome {
     probe(path, &default_allowed_names())
 }
 
-/// ISO8601（RFC3339，含偏移）→ epoch 秒；解析失败返回 `None`（跳过时间校验，
-/// 与 Python `_parse_epoch` 失败 → 不校验一致）。
+/// RFC3339 时间串转 epoch 秒；解析失败返回 None，调用方随之跳过时间校验，
+/// 与后端行为一致。
 pub fn parse_epoch(value: &str) -> Option<f64> {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
         return Some(dt.timestamp() as f64 + dt.timestamp_subsec_nanos() as f64 / 1e9);
     }
-    // Python `datetime.fromisoformat` 也接受无偏移的 naive 字符串（按本地时区解释）
+    // 无时区偏移的时间串按本地时区解释，与后端解析行为一致
     if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f") {
         use chrono::TimeZone;
         if let Some(dt) = chrono::Local.from_local_datetime(&naive).single() {

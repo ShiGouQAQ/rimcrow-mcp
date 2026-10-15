@@ -1,16 +1,12 @@
 //! `--spawn` / `--spawn-headless`：探活失败时拉起 RimCrow，有界轮询 endpoint 写出。
 //!
-//! - **防重入**：探活通过 → 直接 attach，绝不二次拉起；本模块只在
-//!   「未检出可用 endpoint」时被调用，且每个 bridge 进程至多尝试一次
-//!   （由 `SpawnGate` 的 `OnceCell` 保证）。
-//! - 拉起目标解析顺序：
-//!   1. env `RIMCROW_SPAWN_CMD`（存在则按 shell 规则切分执行，开发态/测试用）
-//!   2. bridge 同目录的 `RimCrow.exe`
-//!   3. 都没有 → 因果错误 + `nextActions` 告知手动启动
-//! - `--spawn-headless` = 拉起时附带 `--browser --no-open`（与 desktop 分支等价追加）。
-//! - Windows 下用 `CREATE_NO_WINDOW` 拉起子进程：**不闪控制台窗口**；
-//!   GUI 子进程本身的窗口显示不受该标志影响（正常显示）。
-//! - 就绪判据 = **endpoint 文件写出生效**，不等 GUI 窗口出现；有界 15s。
+//! 防重入：探活通过就直接 attach，绝不二次拉起；本模块只在未检出可用 endpoint 时
+//! 被调用，且每个 bridge 进程至多尝试一次（由 SpawnGate 保证）。拉起目标先看环境
+//! 变量 RIMCROW_SPAWN_CMD（存在则按 shell 规则切分执行，开发态与测试用），再看
+//! bridge 同目录的 RimCrow.exe，都没有时给因果错误并提示手动启动。--spawn-headless
+//! 在拉起时附带 --browser --no-open。Windows 下用 CREATE_NO_WINDOW 拉起子进程，
+//! 不闪控制台窗口，GUI 子进程自身的窗口显示不受该标志影响。就绪判据是 endpoint
+//! 文件写出生效，不等 GUI 窗口出现，轮询上限 15 秒。
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -27,28 +23,19 @@ pub const SPAWN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// 按 shell 参数规则切分一行命令（引号 / 转义），不经过 `cmd` 解释器。
+/// 按 shell 参数规则切分一行命令（引号与转义），不经过 `cmd` 解释器。
 ///
-/// 规则（自实现，见单测）：
-/// - 未引号：空白分词；`\` 仅在**下一个字符是空白 / 引号 / 反斜杠**时转义，
-///   否则按字面保留（保证 `C:\Windows\System32\cmd.exe` 这类未加引号的
-///   Windows 路径不被吃掉反斜杠）
-/// - `"..."`：`\` 仅转义 `"` 与 `\`，其余字符字面
-/// - `'...'`：全部字面（含 `\`），遇到下一个 `'` 结束（POSIX 语义：单引号内无转义）
-/// - 空引号串会产生空参数（`has` 标志）
+/// 自实现而不引现成 crate：shlex 与 shell-words 是纯 POSIX 语义，未加引号的 `\`
+/// 一律当转义符，`C:\Windows\System32\cmd.exe` 这类未加引号的 Windows 路径会被
+/// 吃掉反斜杠直接作废；winsplit 镜像 Windows 命令行参数规则，只成对处理双引号，
+/// 不支持单引号字面量。本函数输入面只有开发与测试用的 RIMCROW_SPAWN_CMD（非用户
+/// 输入），切分结果经 Command 直接执行、不经 shell 也不走 cmd，契约只需本函数
+/// 切分与 launch 执行两相自洽，无需与 MSVCRT 逐字一致，因此自实现换得未引号路径
+/// 的反斜杠安全与单引号字面量，代价约六十行加单测。
 ///
-/// **为什么不引现成 crate**（2026-09-28 复核 crates.io / docs.rs）：
-/// - `shlex` 1.3.0（当前最新 2.0.1）与 `shell-words` 1.1.1 都是**纯 POSIX** 解析
-///   （docs.rs 原文：POSIX.1-2008 / Python `shlex` / `wordexp` 口径）——未加引号的
-///   `\` 一律当转义符，`C:\Windows\System32\cmd.exe` 会被切成
-///   `C:WindowsSystem32cmd.exe`，Windows 路径直接作废；
-/// - `winsplit` 0.1 镜像 `CommandLineToArgvW` / VC++ 2008 规则，**只有 `"` 成组**，
-///   不支持单引号字面量（`'a b'` 会按空白拆成两个参数），与上面第三条规则冲突；
-/// - 本函数输入面只有开发/测试用的 env `RIMCROW_SPAWN_CMD`（非用户输入），切分结果
-///   经 `Command::new().args()` **不经 shell、不走 `cmd` 直接执行**，契约只需
-///   「本函数切分 ↔ `launch` 执行」自洽，无需与 MSVCRT/`CommandLineToArgvW` 逐字一致；
-/// - 换取的收益 = 未引号路径反斜杠安全 + 单引号字面量，代价约 60 行 + 单测，
-///   故自实现而非引依赖。
+/// 规则：未引号段按空白分词，`\` 仅在后随空白、引号或反斜杠时转义，否则按字面
+/// 保留；双引号段内 `\` 仅转义 `"` 与 `\`，其余字符字面；单引号段内全部字面，
+/// 遇到下一个单引号结束；空引号串产出空参数。
 pub fn split_command(input: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
@@ -114,7 +101,7 @@ pub fn split_command(input: &str) -> Vec<String> {
     out
 }
 
-/// 拉起计划：程序 + 参数 + 追加的工作目录（可选）。
+/// 拉起计划：程序与参数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnPlan {
     pub program: String,
@@ -175,15 +162,13 @@ pub fn resolve_spawn_plan(headless: bool) -> Result<SpawnPlan, String> {
     Ok(plan)
 }
 
-/// 拉起子进程（Windows：`CREATE_NO_WINDOW`，不闪控制台窗口；GUI 窗口正常显示）。
+/// 拉起子进程。Windows 下默认带 CREATE_NO_WINDOW，不闪控制台窗口，GUI 窗口正常
+/// 显示；环境变量 RIMCROW_MCP_SPAWN_NO_WINDOW=0 可关掉该标志（诊断用）。
 ///
-/// **stdio 隔离**：
-/// - `stdin = NUL`：绝不把 JSON-RPC 输入通道交给子进程（否则子进程可能抢读/吞掉客户端消息；
-///   实测某些控制台子进程会因此在初始化期挂死）
-/// - `stdout = NUL`：子进程 stdout 绝不能混进本桥的 JSON-RPC 通道
-/// - `stderr = inherit`：子进程诊断信息并入本桥 stderr 日志（安全，stdout 纪律只约束 stdout）
-///
-/// `RIMCROW_MCP_SPAWN_NO_WINDOW=0` 可关掉无窗口标志（诊断用）。
+/// stdio 隔离：stdin 接 NUL，绝不把 JSON-RPC 输入通道交给子进程，否则子进程可能
+/// 抢读或吞掉客户端消息，实测某些控制台子进程会因此在初始化期挂死；stdout 接
+/// NUL，子进程输出绝不混进本桥的 JSON-RPC 通道；stderr 保持继承，子进程诊断信息
+/// 并入本桥 stderr 日志。
 pub fn launch(plan: &SpawnPlan) -> std::io::Result<Child> {
     let mut cmd = Command::new(&plan.program);
     cmd.args(&plan.args);
@@ -203,10 +188,10 @@ pub fn launch(plan: &SpawnPlan) -> std::io::Result<Child> {
     cmd.spawn()
 }
 
-/// 有界轮询 endpoint 写出生效（就绪判据 = endpoint，不等窗口）。
+/// 有界轮询 endpoint 写出生效，就绪判据是 endpoint 本身，不等窗口出现。
 ///
-/// `child` 用于提前发现「拉起的进程立即失败退出」；进程提前退出但
-/// exit code 为 0（可能委托了真正的启动器）时继续轮询到超时。
+/// child 用于提前发现拉起的进程立即失败退出；进程提前退出但 exit code 为 0
+/// （可能委托了真正的启动器）时继续轮询到超时。
 pub async fn wait_for_endpoint(
     endpoint_path: &Path,
     mut child: Child,
@@ -258,7 +243,7 @@ pub async fn wait_for_endpoint(
 
 /// 拉起 + 等待就绪的完整流程（供 `SpawnGate` 调用）。
 pub async fn spawn_and_wait(endpoint_path: &Path, headless: bool) -> Result<(), String> {
-    // 已经可用就不二次拉起（二次防线，调用方已探过一次）
+    // 已经可用就不二次拉起；这是二次防线，调用方已探活过一次
     if probe_default(endpoint_path).is_ready() {
         return Ok(());
     }
@@ -401,7 +386,7 @@ mod tests {
             program: "cmd".into(),
             args: vec!["/c".into(), "exit".into(), "0".into()],
         };
-        // 直接拉起一个立即返回 0 的进程 + 不存在的 endpoint → 只能超时
+        // 拉起一个立即返回 0 的进程且 endpoint 不存在，结果只能是有界超时
         let child = launch(&plan).expect("launch cmd");
         let started = Instant::now();
         let result = rt.block_on(wait_for_endpoint(&path, child, &plan, Duration::from_millis(600)));

@@ -1,20 +1,19 @@
-//! 错误信封 —— 与 RimCrow `backend/mcp_guard.py::build_error_text` 同形。
+//! 错误信封——与 RimCrow 后端的错误信封同形。
 //!
-//! agent 对一次调用的结果只有一次阅读机会：`message` 必须自足（含因果事实），
-//! `nextActions` 给出可直接执行的自纠动作。
+//! agent 对一次调用的结果只有一次阅读机会：message 必须自足、写明因果事实，
+//! nextActions 给出可直接执行的自纠动作。
 //!
-//! 产物是**单个合法 JSON 字符串**，作为 MCP `tools/call` 的单个 text 内容返回，
-//! 由调用方包成 `CallToolResult::error(...)`（MCP 侧 `isError:true`）。
-//!
-//! 形状：`{"status":"error","message":"...","nextActions":["...", ...]}`
-//! 序列化约束对齐 Python `json.dumps(..., ensure_ascii=False, separators=(",", ":"))`：
-//! 紧凑、无多余空白、非 ASCII 不转义。
+//! 产物是单个合法 JSON 字符串，作为 MCP tools/call 的单个 text 内容返回，由调用方
+//! 包成 isError:true 的 CallToolResult。形状是
+//! `{"status":"error","message":"...","nextActions":["...", ...]}`；序列化与后端
+//! json.dumps(ensure_ascii=False, separators=(",", ":")) 的产物对齐：紧凑、无多余
+//! 空白、非 ASCII 不转义。
 
 use serde_json::{json, Map, Value};
 
 /// 构造错误信封文本。
 ///
-/// `next_actions` 为空时不写 `nextActions` 键（与 Python 侧 `if next_actions:` 一致）。
+/// next_actions 为空时不写 nextActions 键，与后端行为一致。
 pub fn build_error_text(message: &str, next_actions: &[String]) -> String {
     let mut payload = Map::new();
     payload.insert("status".into(), Value::String("error".into()));
@@ -25,7 +24,7 @@ pub fn build_error_text(message: &str, next_actions: &[String]) -> String {
     Value::Object(payload).to_string()
 }
 
-/// 便捷构造：`&[&str]` → `Vec<String>`（单测与调用方简化用）。
+/// 便捷构造：接受字符串切片列表，供单测使用。
 #[allow(dead_code)]
 pub fn build_error_text_simple(message: &str, next_actions: &[&str]) -> String {
     build_error_text(
@@ -71,7 +70,7 @@ mod tests {
 
     #[test]
     fn matches_python_reference_output() {
-        // 与 mcp_guard.build_error_text("x", ["a"]) 的 Python 产物逐字一致
+        // 与后端错误信封的产物逐字一致
         let mine = build_error_text("x", &["a".to_string()]);
         assert_eq!(mine, r#"{"status":"error","message":"x","nextActions":["a"]}"#);
     }
