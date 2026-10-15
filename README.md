@@ -92,4 +92,4 @@ cargo test
 
 ## License
 
-MIT
+本桥以 **GPL-3.0-or-later** 发布（见 [LICENSE](./LICENSE)）。RimCrow GUI 本体遵循其上游的 MIT 许可证，与本桥是相互独立的两个作品。

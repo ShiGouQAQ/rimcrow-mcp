@@ -3,7 +3,7 @@ name = "rimcrow-mcp"
 version = "0.1.0"
 edition = "2021"
 description = "RimCrow MCP bridge: a thin stdio <-> Streamable HTTP bridge for RimCrow"
-license = "MIT"
+license = "GPL-3.0-or-later"
 publish = false
 
 [dependencies]
