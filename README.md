@@ -1,105 +1,92 @@
 # rimcrow-mcp
 
-RimCrow MCP **生产入口** `rimcrow-mcp.exe` —— 一个极薄的 stdio ↔ Streamable HTTP 桥。
+RimCrow 的 MCP 生产入口：一个极薄的 **stdio ↔ Streamable HTTP** 桥，把 RimCrow GUI 内嵌的 MCP 工具面接到任意只讲 stdio 的 MCP 客户端（OpenCode、ZCode、Claude Code、Codex 等）。
 
 ```text
-MCP 客户端(ZCode/OpenCode) --stdio--> rimcrow-mcp.exe --Streamable HTTP--> RimCrow.exe 内嵌端点
-                                    （冷启动 <1s）                        （mcp-embed，FastMCP 工具层）
-                                     tools/list 透传优先                    endpoint 文件 url/pid/token
-                                     嵌入快照 = GUI 未开时保底               探活通过 → 直接 attach，绝不二次拉起
+MCP 客户端 ──stdio──> rimcrow-mcp.exe ──Streamable HTTP──> RimCrow GUI 内嵌端点
 ```
 
-权威规格：`E:\Games\RimWorld\dev\RimCrow\.worktrees\feat-mcp-server\plan\SPEC-rust-bridge.md`（R1-R9、§5 错配矩阵、§7 交付件、§8 验收）。
-endpoint 文件契约：`plan\SPEC-mcp-embed.md` §4.3（`schema_version=1`）。
+基于 [rmcp](https://github.com/modelcontextprotocol/rust-sdk)（MCP 官方 Rust SDK）实现，冷启动不到一秒，发布形态是单个约 4 MB 的可执行文件，运行期不落任何外部清单文件。
 
-## 构建 / 测试
+[RimCrow](https://github.com/Inky-Feather/RimCrow) 是 RimWorld 的模组管理器；本仓只含桥，MCP 数据面（工具实现与 endpoint 文件）由 RimCrow 侧提供。
+
+## 为什么需要它
+
+RimCrow 的数据面是 GUI 进程内的 loopback HTTP 端点（bearer 鉴权），而多数 agent 客户端只会拉起一个 stdio 子进程，桥负责两种形态之间的转换。GUI 没开时客户端也要能完成握手、看到工具清单，桥在编译期嵌入一份工具快照作为保底。桥与 GUI 是两个独立产物、版本可能有代差，桥把代差变成可读的错误：版本错配时点名两侧版本，新参数会被旧 GUI 静默忽略前就地拦下——「假成功」比报错危险。
+
+## 工作方式
+
+initialize 永不依赖上游：instructions 与版本自报（crate 版本、快照里的 RimCrow 版本、快照时间）来自嵌入快照，GUI 未开也能握手。
+
+tools/list 双模：探活通过时实时透传上游全量清单（上游分页在桥侧合并为单页），不可达时回落嵌入快照。两条路径都按 MCP 2026-07-28 方言自报 `ttlMs: 0`（清单立即过期，真相始终在上游）与 `cacheScope: "private"`（工具面随本机档案变化，不进跨用户共享缓存）。
+
+tools/call 先探活再转发：bearer 由 rmcp transport 注入，会话由 transport 维护，上游的 isError 结果逐字回抛。转发前做参数预校验——按当前生效清单（实时优先、快照兜底）拦下 schema 未声明的参数、明显类型不符与 enum 越界，错误文案列出该工具当前生效的已知参数；未知工具、空参数、合法参数一律原样透传。类型判定按服务端 pydantic 的宽松语义放行可转换取值，宁可放过、不可误杀。
+
+任何不可达都以 `isError: true` 加因果文案（路径、pid、两侧版本）与 `nextActions` 动作列表降级，绝不返回空洞的 timeout 文案。桥无状态：进程内只持有 endpoint 路径与上游会话，多开是设计行为。
+
+## 构建与接入
+
+需要 Rust 工具链：
 
 ```powershell
-cargo build --release        # 产物 target\release\rimcrow-mcp.exe（约 4.0 MB）
-cargo test                   # 68 个单测
-
-# 冒烟五态唯一入口已收敛到 RimCrow 仓库（本目录不留重复件）：
-cd E:\Games\RimWorld\dev\RimCrow\.worktrees\feat-mcp-server
-uv run python scripts\smoke_bridge.py      # cold / mismatch / fake / spawn / live 全跑
-uv run python scripts\smoke_bridge.py --live   # 单场景
+cargo build --release   # 产物 target\release\rimcrow-mcp.exe
+cargo test
 ```
 
-| 冒烟场景（scripts/smoke_bridge.py） | 覆盖 |
-| --- | --- |
-| `--cold` | R1 握手 <1s、R2 快照清单、R4 因果 isError+nextActions、stdout 纪律、退出码 0、10 次 spawn/kill + temp 零新增 |
-| `--mismatch` | §5 场景 3（pid 过期）/ 场景 6（endpoint schema v2）文案与两侧版本号 |
-| `--fake` | R3 透传（list/call）、远端 isError 逐字回抛、§5 场景 4（unknown tool 版本增强）、R8 版本错配告警、bearer 拒绝——**上游为本目录 `fake_upstream.py` 测试替身，非 RimCrow** |
-| `--spawn` | R5/D11 拉起→endpoint 生效→转发、二次调用不重复拉起、防重入进程计数 |
-| `--live` | 真实 RimCrow 端点透传；端点不在时打印 `[SKIP]` |
+随 RimCrow 发布包分发的 `rimcrow-mcp.exe` 与同批 GUI 一起构建，直接用即可，通常无需自己编译。
 
-`tools-cache.json` **是构建期输入，不是手写文件**，由 RimCrow 仓库的生成器产出：
+接入 MCP 客户端：把本桥注册为 stdio server。以通用 `mcpServers` 配置为例：
 
-```powershell
-cd E:\Games\RimWorld\dev\RimCrow\.worktrees\feat-mcp-server
-uv run python scripts\gen_tool_cache.py     # 输出 → 本目录 tools-cache.json
-cd E:\Games\RimWorld\dev\rimcrow-mcp
-cargo build --release                        # include_str! 重新嵌入
+```json
+{
+  "mcpServers": {
+    "rimcrow": {
+      "command": "C:\\path\\to\\rimcrow-mcp.exe"
+    }
+  }
+}
 ```
 
-## CLI
+前置条件：RimCrow GUI 在运行，或允许桥自动拉起。GUI 就绪后会把连接信息写进 `%LOCALAPPDATA%\RimCrow\mcp-endpoint.json`；桥每次调用都重新探活，GUI 重启不需要重启桥。
 
-```
-rimcrow-mcp.exe [--spawn] [--spawn-headless] [--version] [--help]
-```
+## CLI 与环境变量
 
 | 参数 | 行为 |
 | --- | --- |
-| `--spawn` | 未检出 endpoint → 拉起 RimCrow → 有界 15s 轮询 endpoint 写出生效；**探活通过绝不二次拉起**（D11） |
+| `--spawn` | 未检出 endpoint 时拉起 RimCrow GUI，有界轮询 endpoint 写出（15 秒）；探活通过绝不二次拉起 |
 | `--spawn-headless` | 同上，拉起时附带 `--browser --no-open` |
-| `-V/--version` | 打印版本三元组：crate 版本 + 快照 rimcrow_version + captured_at |
-| `-h/--help` | 用法 |
+| `-V` / `--version` | 打印版本三元组：crate 版本 + 快照 RimCrow 版本 + 快照时间 |
+| `-h` / `--help` | 用法 |
 
-环境变量：
-
-| 变量 | 含义 |
+| 环境变量 | 含义 |
 | --- | --- |
 | `RIMCROW_MCP_ENDPOINT` | 覆盖 endpoint 文件路径（默认 `%LOCALAPPDATA%\RimCrow\mcp-endpoint.json`） |
-| `RIMCROW_SPAWN_CMD` | 覆盖拉起命令（按 shell 规则切分后直接执行，不经 `cmd`），如 `python main.py --browser --no-open`。**为何自实现而不引 `shlex` / `shell-words` / `winsplit`**：见 `src/spawn.rs` 中 `split_command` 的文档注释（POSIX 库会吃掉未引号路径的反斜杠、`winsplit` 不支持单引号字面量） |
-| `RIMCROW_MCP_LOG` | 日志级别，默认 `info`；**日志只写 stderr** |
-| `RIMCROW_MCP_SPAWN_NO_WINDOW` | 设 `0` 可关掉拉起子进程时的 `CREATE_NO_WINDOW`（诊断用） |
+| `RIMCROW_SPAWN_CMD` | 覆盖拉起命令（按 shell 规则切分后直接执行，不经 cmd 解释器），如 `python main.py --browser --no-open` |
+| `RIMCROW_MCP_LOG` | 日志级别，默认 `info`；日志只写 stderr，stdout 只有 JSON-RPC |
+| `RIMCROW_MCP_SPAWN_NO_WINDOW` | 设 `0` 关闭拉起子进程时的无窗口标志（诊断用） |
 
-拉起目标解析顺序：`RIMCROW_SPAWN_CMD` → bridge 同目录 `RimCrow.exe` → 因果错误 + `nextActions`。
+## endpoint 文件契约
 
-**子进程 stdio 隔离（R7，实测教训）**：拉起的子进程 `stdin=NUL`、`stdout=NUL`、
-`stderr=继承`。若继承桥的 stdin/stdout，实测会出现两个故障——子进程把输出混进
-JSON-RPC 通道（`cmd /c echo hi` 直接打脏帧）、以及控制台子进程在初始化期挂死约 15s
-（Python 侧表现为解释器停在 `site` 阶段、CPU 恒 0）。`stderr` 保留继承以便诊断信息进日志。
+`mcp-endpoint.json` 由 RimCrow GUI 写出，请勿手工编辑。字段：`schema_version`（当前为 1）、`url`、`pid`、`token`、`started_at`、`mode`。
 
-## 行为要点
-
-- **R1 保底握手**：`initialize` 纯本地（instructions / serverInfo.version 来自嵌入快照），实测 ~15-25 ms。
-- **R2 清单双模**：`tools/list` 每次实时透传上游（上游分页在此合并成单页、不下发 cursor）；
-  探活失败 / 上游不可达 → 嵌入快照全量应答 + stderr 因果日志。
-- **R3 转发**：`tools/call` 探活 → HTTP（`Authorization: Bearer <token>` 由 rmcp transport 注入，
-  `mcp-session-id` 由 transport 建会话时持有并逐请求携带）→ 远端 `isError` 结果逐字回抛。
-- **R4 降级**：endpoint 缺失 / pid 过期 / schema 超版 / 非 loopback → `isError:true` +
-  因果文案（含路径、pid、两侧版本号）+ `nextActions[]`，**无空洞 timeout 文案**。
-- **R7 stdout 纪律**：stdout 只有 JSON-RPC；tracing 全 stderr；EOF → 退出码 0；
-  panic → 退出码 1 + stderr 一行（自定义 hook，不弹窗）。
-- **R8 版本自报**：`rimcrow-mcp <crate>（快照 RimCrow <X> @ <captured_at>）`；
-  成功 attach 后比对上游 `serverInfo.version`，不一致 → stderr 警告一行（不阻断）。
-- **R9 桥无状态**：进程内只持有 endpoint 路径 + 上游会话（会话属允许状态），不缓存清单；多开是设计行为。
-
-## 源码结构
-
-| 文件 | 职责 |
-| --- | --- |
-| `src/main.rs` | CLI、日志→stderr、panic hook、退出码、tokio runtime 接线 |
-| `src/bridge.rs` | `ServerHandler`（initialize / tools/list / tools/call）、上游会话缓存、`SpawnGate` |
-| `src/endpoint.rs` | endpoint 文件读取 + 探活（`sysinfo`：pid 存活 / 进程名白名单 / 启动时间 CLOCK_SKEW=5、MAX_BOOT=300） |
-| `src/envelope.rs` | 错误信封 `{"status":"error","message":...,"nextActions":[...]}`（与 `mcp_guard.build_error_text` 同形） |
-| `src/snapshot.rs` | `include_str!("../tools-cache.json")` 解析 → `rmcp::model::Tool` |
-| `src/spawn.rs` | `--spawn` 拉起（`CREATE_NO_WINDOW` + stdio 隔离）、shell 式参数切分（自实现，选型理由见 `split_command` 注释）、15s 有界轮询 |
-| `fake_upstream.py` | 最小 Streamable HTTP MCP 上游（**测试替身，非 RimCrow**），供 RimCrow 仓 `scripts/smoke_bridge.py` 的 fake 场景使用；**为何不用 rmcp 的 `StreamableHttpService`（feature `transport-streamable-http-server`，本 crate `Cargo.toml` 未启用）** 见该文件模块 docstring |
+桥探活时做三道校验：schema 版本受支持；进程存活且进程名在白名单内（rimcrow.exe、python.exe、pythonw.exe）；endpoint 写出时间与进程启动时间吻合。Windows 的 pid 会复用，时间比对是防冒名连接的主防线；URL 只接受 127.0.0.1 loopback，防止被诱导连到外部地址。
 
 ## 已知边界
 
-- 数据面单例互斥已落地（`backend/lifecycle.py`，MAP D21）：`--spawn` 拉起时若已有实例在跑，
-  新实例静默退出（exit 0），桥按「endpoint 写出生效」为就绪判据，不受影响。
-- 进度通知（`progress`）不跨桥转发；上游 MRTR `input_required` / Tasks `task` 不代为续跑，均给因果 `isError`。
-- 旧 `RimCrow.exe --mcp` Python 薄层已按 D3 五修从代码与客户端配置中移除；残留进程与本桥无关。
+- 上游的多轮请求（input_required）与任务化（task）结果不代为续跑，返回因果错误并指引直连端点处理。
+- 进度通知不跨桥转发。
+- `--spawn` 拉起时若已有 GUI 实例在跑，新实例按 RimCrow 的单实例互斥静默退出；桥以 endpoint 写出为就绪判据，不受影响。
+
+## 开发
+
+源码分两层：`main` 负责 CLI、stderr 日志、panic 收敛与退出码；`bridge` 实现 MCP handler 与编排。其余五个叶子模块互不依赖、各自可单测——`endpoint`（文件探活）、`spawn`（进程拉起）、`snapshot`（嵌入快照解析）、`validate`（参数预校验）、`envelope`（错误信封）。
+
+`fake_upstream.py` 是标准库零依赖的上游替身，用于脱离 GUI 验证整条透传链路（bearer、会话、清单与调用转发、isError 回抛、未知工具增强文案、版本错配告警）。手动使用：`python fake_upstream.py --port <port> --endpoint <路径>`，endpoint 文件写出后桥即可探活连接。
+
+`tools-cache.json` 是构建期生成物：由 RimCrow 侧工具从真实工具注册表导出、经 `include_str!` 嵌入二进制。快照不手写、文件不手编；工具面变化时重新生成快照后重编译。
+
+方言兼容由桥吸收：对旧方言上游自动补齐必填的 `resultType` 与缓存提示字段，对旧方言客户端由 rmcp 按协商版本剥除这些字段，两种对端都成立。
+
+## License
+
+MIT
