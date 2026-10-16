@@ -15,14 +15,14 @@
 //! patternProperties 与 propertyNames（两者意味着动态键名）时拦，true、子 schema 与
 //! 缺省形状都按 JSON Schema 默认语义放行额外属性，按 schema 判定、不一刀切。
 //!
-//! 判定基准与清单双模同源：上游实时 tools/list 优先，拿不到才用嵌入快照，基准永远是
-//! 当前生效的那份清单而不是写死的快照。基准的选取在 bridge 层完成，本模块只接受
-//! 已选好的清单与其 inputSchema。
+//! 校验基准与 tools/list 用同一套来源逻辑：上游实时 tools/list 优先，拿不到才用嵌入
+//! 快照，基准永远是当前生效的那份清单而不是写死的快照。基准的选取在 bridge 层完成，
+//! 本模块只接受已选好的清单与其 inputSchema。
 //!
-//! 产物是 ArgIssue 列表；错误信封（isError:true 加 message 与 nextActions，与 RimCrow
-//! 错误信封同形）由 bridge 层组装，本模块不产出工具结果。ttlMs 与 cacheScope 是 MCP
-//! 2026-07-28 规范对 tools/list 等清单类结果的缓存提示字段，不属于 tools/call 结果，
-//! 错误信封不携带。
+//! 产物是 ArgIssue 列表；错误信封（isError:true 加 message 与 nextActions，字段与
+//! RimCrow 后端的错误结构一致）由 bridge 层组装，本模块不产出工具结果。ttlMs 与
+//! cacheScope 是 MCP 2026-07-28 规范对 tools/list 等清单类结果的缓存提示字段，不属于
+//! tools/call 结果，错误信封不携带。
 
 use serde_json::{Map, Value};
 

@@ -7,7 +7,7 @@
 //! 附近的允许窗口内；Windows 的 pid 会复用，启动时间比对才是防冒名的主防线。
 //! 进程名与启动时间通过成熟库 sysinfo 获取，不自造轮子。
 //!
-//! reason 是给 agent 看的因果陈述，包含路径与 pid 等事实，直接进降级错误文案。
+//! reason 是给 agent 看的原因说明，包含路径与 pid 等事实，直接进降级错误文案。
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -52,7 +52,7 @@ impl EndpointInfo {
 /// 探活状态。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeStatus {
-    /// endpoint 可用，可直接 attach。
+    /// endpoint 可用，可直接连接。
     Ready,
     /// endpoint 文件不存在。
     Missing,
@@ -62,7 +62,7 @@ pub enum ProbeStatus {
     UnsupportedSchema(i64),
 }
 
-/// 探活产物：状态 + 结构化 endpoint + 给 agent 的因果陈述。
+/// 探活产物：状态 + 结构化 endpoint + 给 agent 的原因说明。
 #[derive(Debug, Clone)]
 pub struct ProbeOutcome {
     pub status: ProbeStatus,
@@ -86,8 +86,8 @@ impl ProbeOutcome {
 }
 
 /// 探活允许的进程名集合（小写，BTreeSet 保证 `join("/")` 输出顺序稳定）。
-/// rimcrow.exe 是打包主程序名；python.exe 与 pythonw.exe 覆盖开发态 GUI 与
-/// dev attach，同一份后端代码在 Windows 下可能以两者之一运行。
+/// rimcrow.exe 是打包主程序名；python.exe 与 pythonw.exe 覆盖开发态运行的后端
+/// （GUI 或直连调试），同一份后端代码在 Windows 下可能以两者之一运行。
 pub fn default_allowed_names() -> BTreeSet<String> {
     ["rimcrow.exe", "python.exe", "pythonw.exe"]
         .iter()
@@ -135,7 +135,7 @@ pub fn read_endpoint(path: &Path) -> Result<Option<EndpointInfo>, String> {
     }
 }
 
-/// 探活：返回状态、因果 reason 与 endpoint 路径；allowed 为小写进程名白名单。
+/// 探活：返回状态、写明原因的 reason 与 endpoint 路径；allowed 为小写进程名白名单。
 pub fn probe(path: &Path, allowed: &BTreeSet<String>) -> ProbeOutcome {
     let raw = match std::fs::read_to_string(path) {
         Ok(s) => s,
@@ -545,7 +545,7 @@ mod tests {
             return;
         }
         let out = probe_default(&p);
-        // 只断言「不 panic 且 reason 是因果陈述」，不强制 ready（CI/无 GUI 环境）
+        // 只断言「不 panic 且 reason 是原因说明」，不强制 ready（CI/无 GUI 环境）
         assert!(!out.reason.is_empty());
         if out.is_ready() {
             let info = out.ready_info().unwrap();

@@ -4,8 +4,8 @@
 //! 本文件只解析、不生成。bridge 侧用 `include_str!` 在编译期嵌入，发布形态是
 //! 单个可执行文件，运行期不落任何外部清单文件。
 //!
-//! 快照只在两种场合充当真相：tools/list 上游不可达时的保底清单，以及 initialize
-//! 的 instructions 与版本自报（这两样永远不依赖上游）。
+//! 快照只在两种场合充当权威数据：tools/list 上游不可达时的保底清单，以及 initialize
+//! 的 instructions 与版本上报（这两样永远不依赖上游）。
 
 use std::sync::OnceLock;
 
@@ -21,7 +21,7 @@ pub const SNAPSHOT_SCHEMA_VERSION: i64 = 1;
 /// 解析后的快照（`tools` 已转成 rmcp `Tool`）。
 #[derive(Debug, Clone)]
 pub struct Snapshot {
-    /// 快照格式版本（解析期已校验 == 1，保留用于自报/诊断）。
+    /// 快照格式版本（解析期已校验 == 1，保留用于版本上报与诊断）。
     #[allow(dead_code)]
     pub schema_version: i64,
     pub rimcrow_version: String,

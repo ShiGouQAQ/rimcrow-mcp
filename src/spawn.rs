@@ -1,12 +1,12 @@
 //! `--spawn` / `--spawn-headless`：探活失败时拉起 RimCrow，有界轮询 endpoint 写出。
 //!
-//! 防重入：探活通过就直接 attach，绝不二次拉起；本模块只在未检出可用 endpoint 时
+//! 防重入：探活通过就直接连接，绝不二次拉起；本模块只在未检出可用 endpoint 时
 //! 被调用，且每个 bridge 进程至多尝试一次（由 SpawnGate 保证）。拉起目标先看环境
 //! 变量 RIMCROW_SPAWN_CMD（存在则按 shell 规则切分执行，开发态与测试用），再看
-//! bridge 同目录的 RimCrow.exe，都没有时给因果错误并提示手动启动。--spawn-headless
-//! 在拉起时附带 --browser --no-open。Windows 下用 CREATE_NO_WINDOW 拉起子进程，
-//! 不闪控制台窗口，GUI 子进程自身的窗口显示不受该标志影响。就绪判据是 endpoint
-//! 文件写出生效，不等 GUI 窗口出现，轮询上限 15 秒。
+//! bridge 同目录的 RimCrow.exe，都没有时返回写明原因的错误并提示手动启动。
+//! --spawn-headless 在拉起时附带 --browser --no-open。Windows 下用 CREATE_NO_WINDOW
+//! 拉起子进程，不闪控制台窗口，GUI 子进程自身的窗口显示不受该标志影响。就绪判据
+//! 是 endpoint 文件写出生效，不等 GUI 窗口出现，轮询上限 15 秒。
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -117,7 +117,7 @@ impl SpawnPlan {
     }
 }
 
-/// 解析拉起目标。`Err(String)` = 因果陈述（直接进降级文案）。
+/// 解析拉起目标。`Err(String)` = 写明原因的错误说明（直接进降级文案）。
 pub fn resolve_spawn_plan(headless: bool) -> Result<SpawnPlan, String> {
     let mut plan = if let Ok(raw) = std::env::var("RIMCROW_SPAWN_CMD") {
         let trimmed = raw.trim();
@@ -354,7 +354,7 @@ mod tests {
 
     #[test]
     fn resolve_plan_without_env_finds_sibling_or_errors() {
-        // 测试进程在 target/debug/deps/ 下，同目录通常没有 RimCrow.exe → 应给因果错误
+        // 测试进程在 target/debug/deps/ 下，同目录通常没有 RimCrow.exe → 应返回写明原因的错误
         if std::env::var("RIMCROW_SPAWN_CMD").is_ok() {
             return; // 环境被外部设置，跳过（避免依赖顺序）
         }

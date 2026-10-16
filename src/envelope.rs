@@ -1,7 +1,7 @@
-//! 错误信封——与 RimCrow 后端的错误信封同形。
+//! 错误信封——字段与 RimCrow 后端的错误结构完全一致。
 //!
-//! agent 对一次调用的结果只有一次阅读机会：message 必须自足、写明因果事实，
-//! nextActions 给出可直接执行的自纠动作。
+//! agent 对一次调用的结果只有一次阅读机会：message 必须自足、写明原因事实，
+//! nextActions 给出可自行执行的修正动作。
 //!
 //! 产物是单个合法 JSON 字符串，作为 MCP tools/call 的单个 text 内容返回，由调用方
 //! 包成 isError:true 的 CallToolResult。形状是
