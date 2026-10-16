@@ -17,9 +17,16 @@
 //! 桥无状态：进程内只持有 endpoint 路径与上游会话，不缓存清单。
 //!
 //! 参数预校验防「假成功」：tools/call 转发前把调用参数对照当前生效清单（live 优先，
-//! 拿不到才用嵌入快照）拦一道，schema 未声明的参数、明显类型不符、enum 越界都以
-//! isError:true 加因果文案与已知参数列表拒绝；未知工具、空参数、合法参数一律零影响
-//! 原样转发，拦截规则宁可放过不可误杀。
+//! 拿不到才用嵌入快照）拦一道，只拦 schema 未声明的参数（会被旧 GUI 静默忽略的那类，
+//! 判定按 JSON Schema 标准关键字语义，不镜像服务端框架的类型/枚举方言——类型与取值
+//! 错误由服务端自己校验报回）；未知工具、空参数、合法参数一律零影响原样转发，拦截
+//! 规则宁可放过不可误杀。
+//!
+//! 协议方言吸收（双向、只对协议版本，不对具体客户端）：
+//! - 上游旧方言 → 新方言客户端：上游结果线形缺 2026-07-28 必填的 resultType /
+//!   ttlMs / cacheScope，桥补齐后转发；
+//! - 新方言字段 → 旧方言客户端：resultType 由 rmcp 按协商版本剥除，ttlMs /
+//!   cacheScope 由桥按协商版本不发（rmcp 的 legacy 剥除不覆盖这两个字段）。
 
 use std::borrow::Cow;
 use std::path::PathBuf;
@@ -31,7 +38,7 @@ use serde_json::{Map, Value};
 use rmcp::model::{
     CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ClientCapabilities,
     ClientConfig, ContentBlock, Implementation, ListToolsResult, PaginatedRequestParams,
-    ServerCapabilities, ServerConfig, Tool,
+    ProtocolVersion, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::{Peer, RequestContext, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
@@ -329,24 +336,37 @@ impl Bridge {
     }
 
     /// 嵌入快照 → `tools/list` 结果（上游不可达时的保底清单）。
-    fn snapshot_list(snap: &Snapshot) -> ListToolsResult {
-        Self::list_result(snap.tools.clone())
+    fn snapshot_list(snap: &Snapshot, modern_peer: bool) -> ListToolsResult {
+        Self::list_result(snap.tools.clone(), modern_peer)
     }
 
-    /// 清单结果的统一出口，按 MCP 2026-07-28 方言自报缓存提示（该方言把这两个字段
-    /// 列为清单类结果的必填项，rmcp 里它们是 `Option`，缺省时整个字段从序列化产物
-    /// 消失，新版客户端会按缺必填拒收）。
+    /// 清单结果的统一出口，按对端协商的协议版本决定缓存提示字段。
+    ///
+    /// `ttlMs`（SEP-2549）与 `cacheScope` 是 MCP 2026-07-28 规范对 tools/list 等
+    /// 清单类结果的必填项（服务端 MUST 提供）：宽松客户端对缺失的 ttlMs 自行按 0
+    /// 处理，严格按 schema 校验的客户端会拒收（resultType 已有实证的拒收案例）。
+    /// 对协商 ≥ 2026-07-28 的对端必须补齐——上游是旧方言时结果线形里没有它们，
+    /// 反序列化后为 `None`，缺省时序列化整个省略。
+    ///
+    /// 对旧方言对端（< 2026-07-28）这两个字段不存在，rmcp 的 legacy 剥除只处理
+    /// `resultType` 不处理缓存提示，因此由桥自己按协商版本不发；缺省的 ttlMs 在
+    /// 宽松客户端语义里同样是 0，不发不会造成任何行为差异。
     ///
     /// `ttlMs: 0` 表示清单立即过期，客户端每次现取，与「清单真相在上游、桥不缓存」
     /// 的定位一致。`cacheScope: "private"` 表示工具面随本机档案与 GUI 版本变化，属
     /// 用户特定数据，不进跨用户共享缓存。
-    fn list_result(tools: Vec<Tool>) -> ListToolsResult {
-        ListToolsResult {
+    fn list_result(tools: Vec<Tool>, modern_peer: bool) -> ListToolsResult {
+        let result = ListToolsResult {
             tools,
             ..Default::default()
+        };
+        if modern_peer {
+            result
+                .with_ttl_ms(0)
+                .with_cache_scope(CacheScope::Private)
+        } else {
+            result
         }
-        .with_ttl_ms(0)
-        .with_cache_scope(CacheScope::Private)
     }
 
     /// 上游 `tools/list` 全量拉取（分页由 rmcp `list_all_tools` 处理）。
@@ -525,7 +545,7 @@ impl Bridge {
             known.join("、")
         };
         let message = format!(
-            "参数预校验失败：{detail}；服务端版本较旧或该参数/取值未被识别；工具 {name} 当前生效的已知参数：{known_txt}；清单来源：{source}（{}）",
+            "参数预校验失败：{detail}；服务端版本较旧或该参数未被识别；工具 {name} 当前生效的已知参数：{known_txt}；清单来源：{source}（{}）",
             self.version_ctx()
         );
         let actions = vec![
@@ -552,15 +572,27 @@ fn tool_result_text(result: &CallToolResult) -> String {
     out
 }
 
-/// 补齐调用结果的 `resultType` 字段。MCP 2026-07-28 方言把该字段列为所有调用结果
-/// 的必填项；上游是旧方言时结果线形里没有它，反序列化后为 `None`，新版客户端会因
-/// 缺必填整单拒收。能走到透传的 Complete 在语义上就是完整结果（task 与
-/// input_required 形态都已被上游拦截改造），补 `"complete"` 恒正确；旧方言对端由
-/// rmcp 在响应层自动剥掉该字段，两种方言都成立。已带值的结果保持原样。
+/// 补齐调用结果的 `resultType` 字段。MCP 2026-07-28 规范把该字段列为所有调用结果
+/// 的必填项（服务端 MUST 提供；宽松客户端对缺失按 complete 处理，严格按 schema
+/// 校验的客户端会拒收，已有实证失败案例）；上游是旧方言时结果线形里没有它，
+/// 反序列化后为 `None`，缺省时序列化整个省略。能走到透传的 Complete 在语义上就是
+/// 完整结果（task 与 input_required 形态都已被上游拦截改造），补 `"complete"` 恒
+/// 正确；对旧方言客户端由 rmcp 在响应层按协商版本自动剥掉该字段（`strip_result_type_
+/// for_legacy_peer`），两种方言都成立。已带值的结果保持原样。
 fn ensure_result_type(result: &mut CallToolResult) {
     if result.result_type.is_none() {
         result.result_type = Some(rmcp::model::ResultType::COMPLETE);
     }
+}
+
+/// 对端协商版本是否 ≥ 2026-07-28——SEP-2322（resultType）与 SEP-2549（ttlMs /
+/// cacheScope）字段成为必填的起始版本。协商版本未知时按旧方言处理（与 rmcp 的
+/// legacy 判定同口径，宁缺勿滥）：缓存提示不发，宽松客户端对缺省 ttlMs 自行按 0
+/// 处理，不会有行为差异。ISO 日期版本按字典序比较与 rmcp 自身约定一致。
+fn is_modern_peer(version: Option<ProtocolVersion>) -> bool {
+    version
+        .as_ref()
+        .is_some_and(|v| v.as_str() >= ProtocolVersion::V_2026_07_28.as_str())
 }
 
 /// 判断上游错误是否是 rmcp 的「传输已断」标记；rmcp 自带的同类判断方法未公开，
@@ -593,18 +625,20 @@ impl ServerHandler for Bridge {
     /// 清单双模：探活通过时实时透传上游全量清单，否则以嵌入快照保底。
     ///
     /// 上游分页在此合并为单页返回，不下发 cursor，客户端一次性拿全量。
+    /// 缓存提示字段按对端协商版本决定（见 `list_result`）。
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
+        let modern_peer = is_modern_peer(context.protocol_version());
         let out = self.probe();
         if let Some(info) = out.ready_info() {
             match self.upstream_peer(info).await {
                 Ok((peer, _)) => match self.upstream_list(&peer).await {
                     Ok(tools) => {
                         tracing::debug!("tools/list 透传上游：{} 个工具", tools.len());
-                        return Ok(Self::list_result(tools));
+                        return Ok(Self::list_result(tools, modern_peer));
                     }
                     Err(e) => {
                         tracing::warn!("tools/list 透传失败，回落嵌入快照：{e}");
@@ -629,7 +663,7 @@ impl ServerHandler for Bridge {
             );
         }
 
-        Ok(Self::snapshot_list(snapshot::load()))
+        Ok(Self::snapshot_list(snapshot::load(), modern_peer))
     }
 
     /// 探活后转发并原样回抛；任何不可达都以因果 isError 加 nextActions 降级。
@@ -763,16 +797,41 @@ mod tests {
     #[test]
     fn snapshot_list_carries_every_tool_without_cursor() {
         let snap = snapshot::load();
-        let list = Bridge::snapshot_list(snap);
+        let list = Bridge::snapshot_list(snap, true);
         assert_eq!(list.tools.len(), snap.tools.len());
         assert!(list.next_cursor.is_none());
         assert_eq!(list.result_type, Some(rmcp::model::ResultType::COMPLETE));
-        // 新版方言必填的缓存提示字段：结构里在，线形里也在（缺省时序列化整个省略）
+        // 新版方言（2026-07-28）必填的缓存提示字段：结构里在，线形里也在
+        //（缺省时序列化整个省略）
         assert_eq!(list.ttl_ms, Some(0));
         assert_eq!(list.cache_scope, Some(rmcp::model::CacheScope::Private));
         let json = serde_json::to_value(&list).unwrap();
         assert_eq!(json["ttlMs"], 0);
         assert_eq!(json["cacheScope"], "private");
+    }
+
+    /// 旧方言客户端（协商 < 2026-07-28）：缓存提示字段按协商版本不发——rmcp 的
+    /// legacy 剥除只处理 resultType 不处理 ttlMs/cacheScope，这一侧由桥负责。
+    /// resultType 保持 Some(COMPLETE)，线形剥除由 rmcp 响应层完成，桥不重复做。
+    #[test]
+    fn legacy_peer_list_omits_cache_hints() {
+        let snap = snapshot::load();
+        let list = Bridge::snapshot_list(snap, false);
+        assert_eq!(list.ttl_ms, None);
+        assert_eq!(list.cache_scope, None);
+        assert_eq!(list.result_type, Some(rmcp::model::ResultType::COMPLETE));
+        let json = serde_json::to_value(&list).unwrap();
+        assert!(json.get("ttlMs").is_none(), "{json}");
+        assert!(json.get("cacheScope").is_none(), "{json}");
+    }
+
+    /// 版本判定：字典序比较与 rmcp 同口径；未知协商版本按旧方言（宁缺勿滥）。
+    #[test]
+    fn modern_peer_version_threshold() {
+        assert!(is_modern_peer(Some(ProtocolVersion::V_2026_07_28)));
+        assert!(!is_modern_peer(Some(ProtocolVersion::V_2025_11_25)));
+        assert!(!is_modern_peer(Some(ProtocolVersion::V_2025_06_18)));
+        assert!(!is_modern_peer(None));
     }
 
     #[test]

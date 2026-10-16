@@ -5,23 +5,19 @@
 //! 返回全库结果，is_active:false 的条目混在其中）。这类假成功比报错危险，故在转发前
 //! 先由桥拦一道。
 //!
-//! 判定基准与清单双模同源：上游实时 tools/list 优先，拿不到才用嵌入快照，基准永远是
-//! 当前生效的那份清单而不是写死的快照。基准的选取在 bridge 层完成，本模块只接受
-//! 已选好的清单与其 inputSchema。
+//! 只做这一件事，且判定完全按 JSON Schema 的标准关键字语义（properties /
+//! additionalProperties / patternProperties / propertyNames），不镜像任何服务端框架的
+//! 类型强转或枚举语义：类型与取值错误由服务端自己校验并以 isError 报回（MCP 标准行为），
+//! 桥侧再判一遍只会耦合服务端实现细节（框架升级即漂移），还可能在「清单落后于运行中
+//! GUI」时误杀合法取值。缺省参数零影响，不做 required 缺失检查，缺了服务端自己会报。
 //!
 //! 误杀防护遵循宁可放过、不可误杀。未知键只在 additionalProperties 为 false 且没有
 //! patternProperties 与 propertyNames（两者意味着动态键名）时拦，true、子 schema 与
-//! 缺省形状都按 JSON Schema 默认语义放行额外属性，按 schema 判定、不一刀切。类型只报
-//! 明确不符：单一 type，或 anyOf/oneOf 每一支都有明确 type 且全不匹配；allOf、含自由
-//! schema 的分支、无 type 一概不判。类型判定按 pydantic 2.x lax（宽松）转换放行服务端
-//! 会接受的取值——已用 RimCrow 同款 pydantic 2.12.5 实测，字符串 "5"、浮点 3.0、布尔
-//! true、字符串 "yes" 都是合法调用，只拦服务端同样会拒绝的取值。缺省参数零影响，不做
-//! required 缺失检查，缺了服务端自己会报。enum 只对标量取值比对，对象与数组取值的
-//! 相等性语义拿不准就放过。
+//! 缺省形状都按 JSON Schema 默认语义放行额外属性，按 schema 判定、不一刀切。
 //!
-//! 不引 jsonschema 之类的严格校验器：JSON Schema 按类型字面判定，会把服务端经
-//! pydantic lax 转换后实际接受的取值（如字符串 "5" 传给 integer）误判为非法，
-//! 恰是这里最要防的误杀，故按服务端实际行为自建这套窄判定。
+//! 判定基准与清单双模同源：上游实时 tools/list 优先，拿不到才用嵌入快照，基准永远是
+//! 当前生效的那份清单而不是写死的快照。基准的选取在 bridge 层完成，本模块只接受
+//! 已选好的清单与其 inputSchema。
 //!
 //! 产物是 ArgIssue 列表；错误信封（isError:true 加 message 与 nextActions，与 RimCrow
 //! 错误信封同形）由 bridge 层组装，本模块不产出工具结果。ttlMs 与 cacheScope 是 MCP
@@ -30,59 +26,30 @@
 
 use serde_json::{Map, Value};
 
-/// 单个参数问题；`path` 为点分嵌套路径，数组元素形如 `ops[0].foo`，顶层即参数名。
+/// 单个参数问题：取值未被当前生效清单的 inputSchema 声明（= 旧 GUI 会静默忽略的那类
+/// 参数）。`path` 为点分嵌套路径，数组元素形如 `ops[0].foo`，顶层即参数名；`known`
+/// 为该层 schema 已声明的参数（顶层的同名列表由 bridge 统一附在 message 尾部）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ArgIssue {
-    /// `additionalProperties:false` 对象里出现的未知键（= 旧 GUI 会静默忽略的那类参数）。
-    Unknown {
-        path: String,
-        /// 该层 schema 声明的已知参数（顶层的同名列表由 bridge 附在 message 尾部）。
-        known: Vec<String>,
-    },
-    /// 类型明确不符（已按 pydantic lax 转换放行可转换取值）。
-    Type {
-        path: String,
-        expected: String,
-        actual: String,
-    },
-    /// 标量取值不在 `enum` 允许范围内。
-    Enum {
-        path: String,
-        allowed: Vec<String>,
-        actual: String,
-    },
+pub struct ArgIssue {
+    /// 未被识别的参数路径。
+    pub path: String,
+    /// 该层已声明的参数名（properties 键序保持 schema 声明顺序）。
+    pub known: Vec<String>,
 }
 
 impl ArgIssue {
-    /// 中文文案片段（进错误 message，多条以「；」连接）。
+    /// 中文文案片段（进错误 message）。
     pub fn describe(&self) -> String {
-        match self {
-            ArgIssue::Unknown { path, known } => {
-                // 顶层已知参数列表由 bridge 统一附在 message 尾部，这里只补嵌套层的
-                if path.contains('.') || path.contains('[') {
-                    let k = if known.is_empty() {
-                        "该层未声明任何参数".to_string()
-                    } else {
-                        known.join("、")
-                    };
-                    format!("参数 {path} 未被识别（同层已知参数：{k}）")
-                } else {
-                    format!("参数 {path} 未被识别")
-                }
-            }
-            ArgIssue::Type {
-                path,
-                expected,
-                actual,
-            } => format!("参数 {path} 类型不符：期望 {expected}，实际 {actual}"),
-            ArgIssue::Enum {
-                path,
-                allowed,
-                actual,
-            } => format!(
-                "参数 {path} 取值 {actual} 不在允许范围（允许：{}）",
-                allowed.join("、")
-            ),
+        // 顶层已知参数列表由 bridge 统一附在 message 尾部，这里只补嵌套层
+        if self.path.contains('.') || self.path.contains('[') {
+            let k = if self.known.is_empty() {
+                "该层未声明任何参数".to_string()
+            } else {
+                self.known.join("、")
+            };
+            format!("参数 {} 未被识别（同层已知参数：{k}）", self.path)
+        } else {
+            format!("参数 {} 未被识别", self.path)
         }
     }
 }
@@ -96,7 +63,7 @@ pub fn known_params(schema: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// 校验一份对象型调用参数；返回全部问题（空 = 放行）。
+/// 校验一份对象型调用参数中的未知键；返回全部问题（空 = 放行）。
 ///
 /// `schema` = 该工具的 `inputSchema`；`args` = 调用参数（两者非对象时无从判定 → 放行）。
 pub fn validate(schema: &Value, args: &Value) -> Vec<ArgIssue> {
@@ -130,7 +97,7 @@ fn check_object(
         };
         match props.and_then(|p| p.get(key)) {
             Some(sub) => check_value(sub, value, &child, out),
-            None if forbid_extra => out.push(ArgIssue::Unknown {
+            None if forbid_extra => out.push(ArgIssue {
                 path: child,
                 known: props
                     .map(|p| p.keys().cloned().collect())
@@ -141,36 +108,17 @@ fn check_object(
     }
 }
 
-/// 校验单个取值：类型 → enum → 递归嵌套对象 / 数组元素。
+/// 校验单个取值：只向下递归嵌套对象与数组元素找未知键；类型与取值合法性由服务端校验。
 fn check_value(schema: &Value, value: &Value, path: &str, out: &mut Vec<ArgIssue>) {
     let Some(sub) = schema.as_object() else {
         return; // 非对象 schema 无从判定，放过
     };
-
-    if let Some(expected) = type_conflict(sub, value) {
-        out.push(ArgIssue::Type {
-            path: path.to_string(),
-            expected,
-            actual: type_name(value),
-        });
-        return; // 类型已不符，不再往下递归
-    }
-
-    // enum 只比标量，对象与数组取值的相等性语义拿不准，放过
-    if !value.is_object() && !value.is_array() {
-        if let Some(allowed) = sub.get("enum").and_then(Value::as_array) {
-            if !allowed.iter().any(|a| json_eq(a, value)) {
-                out.push(ArgIssue::Enum {
-                    path: path.to_string(),
-                    allowed: allowed.iter().map(render).collect(),
-                    actual: render(value),
-                });
+    match value {
+        Value::Object(obj) => {
+            if let Some(branch) = object_branch(sub) {
+                check_object(branch, obj, path, out);
             }
         }
-    }
-
-    match value {
-        Value::Object(obj) => check_object(object_branch(sub), obj, path, out),
         Value::Array(items) => {
             if let Some(items_schema) = sub.get("items") {
                 for (i, item) in items.iter().enumerate() {
@@ -182,182 +130,34 @@ fn check_value(schema: &Value, value: &Value, path: &str, out: &mut Vec<ArgIssue
     }
 }
 
-/// 对象取值时用于递归的子 schema：本层有 `properties` 就用本层，否则在
-/// anyOf/oneOf 里取第一个对象型分支（联合类型的可空/多形分支）。
-fn object_branch(sub: &Map<String, Value>) -> &Map<String, Value> {
+/// 对象取值时用于递归的子 schema：本层有 `properties` 就用本层；否则在 anyOf/oneOf
+/// 里取**唯一**的对象型分支（联合类型的可空分支常态：{对象 schema, null}）。
+///
+/// 多于一个对象分支时键归属不明（键可能合法地属于其中任何一支，按第一支判会误杀），
+/// 按宁可放过返回 None，整层跳过未知键检查；没有对象型分支同样返回 None（对象取值
+/// 与该 schema 无从对应，交给服务端判）。
+fn object_branch(sub: &Map<String, Value>) -> Option<&Map<String, Value>> {
     if sub.get("properties").is_some() {
-        return sub;
+        return Some(sub);
     }
     for key in ["anyOf", "oneOf"] {
         if let Some(branches) = sub.get(key).and_then(Value::as_array) {
-            for b in branches {
-                if let Some(branch) = b.as_object() {
-                    let is_object = branch.get("type").and_then(Value::as_str) == Some("object")
-                        || branch.get("properties").is_some();
-                    if is_object {
-                        return branch;
-                    }
-                }
+            let object_branches: Vec<&Map<String, Value>> = branches
+                .iter()
+                .filter_map(Value::as_object)
+                .filter(|b| {
+                    b.get("type").and_then(Value::as_str) == Some("object")
+                        || b.get("properties").is_some()
+                })
+                .collect();
+            match object_branches.len() {
+                1 => return Some(object_branches[0]),
+                0 => continue,
+                _ => return None,
             }
         }
-    }
-    sub
-}
-
-/// 类型冲突检测：明确不符时返回期望类型描述，否则 `None`（放行）。
-///
-/// 只在「单一 `type`」或「anyOf/oneOf 每一支都有明确 `type` 且全不匹配」时判定；
-/// 其余形状（`allOf`、自由分支、无 `type`）一律不判——拿不准就只拦未知参数。
-fn type_conflict(schema: &Map<String, Value>, value: &Value) -> Option<String> {
-    if let Some(types) = declared_types(schema.get("type")) {
-        if types.iter().any(|t| type_matches(t, value)) {
-            return None;
-        }
-        return Some(types.join(" | "));
-    }
-    for key in ["anyOf", "oneOf"] {
-        let Some(branches) = schema.get(key).and_then(Value::as_array) else {
-            continue;
-        };
-        if branches.is_empty() {
-            continue;
-        }
-        let mut expected = Vec::with_capacity(branches.len());
-        for b in branches {
-            match declared_types(b.get("type")) {
-                Some(ts) => expected.push(ts.join(" | ")),
-                None => return None, // 含自由分支 → 拿不准 → 整体放过
-            }
-        }
-        let hit = branches.iter().any(|b| {
-            declared_types(b.get("type"))
-                .map(|ts| ts.iter().any(|t| type_matches(t, value)))
-                .unwrap_or(true) // 上面已过滤，安全默认 = 放过
-        });
-        if hit {
-            return None;
-        }
-        return Some(expected.join(" | "));
     }
     None
-}
-
-/// 从 schema 的 `type` 关键字取明确类型列表（缺省/形状不明 → `None` = 不判定）。
-fn declared_types(v: Option<&Value>) -> Option<Vec<&str>> {
-    let types = match v? {
-        Value::String(s) => vec![s.as_str()],
-        Value::Array(items) => {
-            let mut out = Vec::with_capacity(items.len());
-            for it in items {
-                out.push(it.as_str()?);
-            }
-            out
-        }
-        _ => return None,
-    };
-    if types.is_empty() {
-        return None;
-    }
-    Some(types)
-}
-
-/// JSON Schema 类型是否匹配；pydantic lax 转换后服务端会接受的取值一律放行。
-fn type_matches(expected: &str, value: &Value) -> bool {
-    match expected {
-        "string" => value.is_string(),
-        "boolean" => match value {
-            Value::Bool(_) => true,
-            Value::String(s) => pydantic_truthy(s) || pydantic_falsy(s),
-            // pydantic lax 只接受 0 与 1 转 bool（已实测），其余数字拒绝
-            Value::Number(n) => n.as_f64().is_some_and(|f| f == 0.0 || f == 1.0),
-            _ => false,
-        },
-        "integer" => numeric_like(value, true),
-        "number" => numeric_like(value, false),
-        "array" => value.is_array(),
-        "object" => value.is_object(),
-        "null" => value.is_null(),
-        _ => true, // 未知类型关键字（含 "any" 等）→ 不判定
-    }
-}
-
-/// 数字类目标匹配，integer_only 为真时只接受整值。
-///
-/// pydantic 2.12.5 实测放行的可转换取值一律通过：true 转 1、字符串 "5" 转 5、
-/// 整值浮点 3.0 转 3；服务端明确拒绝的才判冲突，如字符串 "not-a-number" 与
-/// 给 integer 的小数 3.5。
-fn numeric_like(value: &Value, integer_only: bool) -> bool {
-    match value {
-        Value::Number(n) => {
-            if !integer_only {
-                return true;
-            }
-            if n.as_i64().is_some() || n.as_u64().is_some() {
-                return true;
-            }
-            n.as_f64()
-                .is_some_and(|f| f.is_finite() && f.fract() == 0.0)
-        }
-        Value::Bool(_) => true, // pydantic lax 把 true 当 1
-        Value::String(s) => match s.trim().parse::<f64>() {
-            Err(_) => false,
-            Ok(f) => !integer_only || (f.is_finite() && f.fract() == 0.0),
-        },
-        _ => false,
-    }
-}
-
-/// pydantic lax 接受的真值字符串（大小写不敏感）。
-fn pydantic_truthy(s: &str) -> bool {
-    matches!(
-        s.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes" | "t" | "true" | "on" | "1"
-    )
-}
-
-/// pydantic lax 接受的假值字符串（大小写不敏感）。
-fn pydantic_falsy(s: &str) -> bool {
-    matches!(
-        s.trim().to_ascii_lowercase().as_str(),
-        "n" | "no" | "f" | "false" | "off" | "0"
-    )
-}
-
-/// 取值的 JSON 文本（字符串带引号，便于进文案）。
-fn render(v: &Value) -> String {
-    v.to_string()
-}
-
-/// 取值是否相等（数字按数值比：`1` == `1.0`，对齐 JSON Schema / pydantic Literal 语义）。
-fn json_eq(a: &Value, b: &Value) -> bool {
-    if a.is_number() && b.is_number() {
-        if let (Some(x), Some(y)) = (a.as_f64(), b.as_f64()) {
-            return x == y;
-        }
-    }
-    a == b
-}
-
-/// 取值类型的展示名（数字按整值区分 integer/number）。
-fn type_name(v: &Value) -> String {
-    match v {
-        Value::Null => "null".to_string(),
-        Value::Bool(_) => "boolean".to_string(),
-        Value::String(_) => "string".to_string(),
-        Value::Array(_) => "array".to_string(),
-        Value::Object(_) => "object".to_string(),
-        Value::Number(n) => {
-            if n.as_i64().is_some()
-                || n.as_u64().is_some()
-                || n.as_f64()
-                    .is_some_and(|f| f.is_finite() && f.fract() == 0.0)
-            {
-                "integer".to_string()
-            } else {
-                "number".to_string()
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -397,14 +197,8 @@ mod tests {
         let args = json!({"scope": "active", "limit": 3});
         let issues = validate(&old_list_mods_schema(), &args);
         assert_eq!(issues.len(), 1, "only scope is unknown: {issues:?}");
-        match &issues[0] {
-            ArgIssue::Unknown { path, known } => {
-                assert_eq!(path, "scope");
-                assert_eq!(known, &["filter", "limit", "offset"]);
-            }
-            other => panic!("expected Unknown, got {other:?}"),
-        }
-        // 文案含参数名（顶层已知列表由 bridge 附在 message 尾部）
+        assert_eq!(issues[0].path, "scope");
+        assert_eq!(issues[0].known, vec!["filter", "limit", "offset"]);
         assert!(issues[0].describe().contains("scope"));
         assert!(issues[0].describe().contains("未被识别"));
         assert_eq!(
@@ -421,6 +215,20 @@ mod tests {
         // 旧 GUI schema 下的调用同样合法（未知参数以「生效清单」为准，不以快照为准）
         let args = json!({"limit": 3, "offset": 0});
         assert!(validate(&old_list_mods_schema(), &args).is_empty());
+    }
+
+    /// 类型与取值合法性由服务端校验：宽松强转语义（如字符串 "5" 传给 integer）、
+    /// enum 越界、类型不符等桥侧一律不判、原样放行。
+    #[test]
+    fn type_and_enum_issues_are_server_side_only() {
+        let schema = new_list_mods_schema();
+        // 字符串数字 / 可疑枚举取值都放行，交服务端判定
+        assert!(validate(&schema, &json!({"limit": "not-a-number"})).is_empty());
+        assert!(validate(&schema, &json!({"scope": "Maybe"})).is_empty());
+        assert!(validate(&schema, &json!({"filter": 123})).is_empty());
+        // 服务端同款 pydantic 宽松语义会接受的取值更不能误杀
+        assert!(validate(&schema, &json!({"limit": "5"})).is_empty());
+        assert!(validate(&schema, &json!({"offset": true})).is_empty());
     }
 
     #[test]
@@ -483,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_object_unknown_key_and_type_checked() {
+    fn nested_object_unknown_key_checked() {
         let schema = json!({
             "type": "object",
             "additionalProperties": false,
@@ -495,30 +303,13 @@ mod tests {
                 }
             }
         });
-        let args = json!({"token": {"path": "x", "bogus": 1, "size": "abc"}});
+        let args = json!({"token": {"path": "x", "bogus": 1}});
         let issues = validate(&schema, &args);
-        assert_eq!(issues.len(), 2, "{issues:?}");
-        match &issues[0] {
-            ArgIssue::Unknown { path, known } => {
-                assert_eq!(path, "token.bogus");
-                assert_eq!(known, &["path", "size"]);
-            }
-            other => panic!("expected Unknown, got {other:?}"),
-        }
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].path, "token.bogus");
+        assert_eq!(issues[0].known, vec!["path", "size"]);
         // 嵌套文案带出同层已知参数
         assert!(issues[0].describe().contains("path"));
-        match &issues[1] {
-            ArgIssue::Type {
-                path,
-                expected,
-                actual,
-            } => {
-                assert_eq!(path, "token.size");
-                assert_eq!(expected, "integer");
-                assert_eq!(actual, "string");
-            }
-            other => panic!("expected Type, got {other:?}"),
-        }
     }
 
     #[test]
@@ -542,91 +333,54 @@ mod tests {
         assert_eq!(issues.len(), 1, "{issues:?}");
         assert_eq!(
             issues[0],
-            ArgIssue::Unknown {
+            ArgIssue {
                 path: "ops[1].bogus".to_string(),
                 known: vec!["op".to_string()],
             }
         );
     }
 
+    /// 可空联合（{对象 schema, null}）取对象分支递归未知键检查。
     #[test]
-    fn clear_type_mismatch_reported() {
-        let schema = json!({"type": "object", "properties": {"filter": {"type": "string"}}});
-        let issues = validate(&schema, &json!({"filter": 123}));
+    fn nullable_union_takes_object_branch() {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "token": {
+                    "anyOf": [
+                        {"type": "object", "additionalProperties": false,
+                         "properties": {"path": {"type": "string"}}},
+                        {"type": "null"}
+                    ]
+                }
+            }
+        });
+        let issues = validate(&schema, &json!({"token": {"bogus": 1}}));
         assert_eq!(issues.len(), 1, "{issues:?}");
-        assert!(matches!(
-            &issues[0],
-            ArgIssue::Type { path, expected, actual }
-                if path == "filter" && expected == "string" && actual == "integer"
-        ));
-        let text = issues[0].describe();
-        assert!(text.contains("期望 string，实际 integer"), "{text}");
+        assert_eq!(issues[0].path, "token.bogus");
+        // null 取值无可递归对象，放过
+        assert!(validate(&schema, &json!({"token": null})).is_empty());
     }
 
+    /// 多个对象分支时键归属不明：按第一支判会误杀属于其它分支的合法键，整层放过。
     #[test]
-    fn union_with_all_declared_branches_mismatch_reported() {
-        // 限速参数（anyOf integer|null）传入服务端必拒的取值（pydantic 2.12 实测同判）
-        let schema = old_list_mods_schema();
-        let issues = validate(&schema, &json!({"limit": "not-a-number"}));
-        assert_eq!(issues.len(), 1, "{issues:?}");
-        assert!(matches!(
-            &issues[0],
-            ArgIssue::Type { expected, .. } if expected == "integer | null"
-        ));
-        // 可空联合：null 合法
-        assert!(validate(&schema, &json!({"limit": null})).is_empty());
-    }
-
-    #[test]
-    fn union_with_free_branch_skipped() {
-        // 分支没有明确 type（自由 schema）→ 拿不准 → 整体放过
-        let schema = json!({
-            "type": "object",
-            "properties": {"x": {"anyOf": [{"minLength": 1}, {"type": "null"}]}}
-        });
-        assert!(validate(&schema, &json!({"x": 123})).is_empty());
-        // allOf 同样不判
-        let schema = json!({
-            "type": "object",
-            "properties": {"y": {"allOf": [{"type": "string"}]}}
-        });
-        assert!(validate(&schema, &json!({"y": 999})).is_empty());
-        // 分支带 pattern 时仍按 type 判（服务端同拒 123），但 pattern 本身不判（放过 "b"）
-        let schema = json!({
-            "type": "object",
-            "properties": {"z": {"anyOf": [{"type": "string", "pattern": "^a"}, {"type": "null"}]}}
-        });
-        assert_eq!(validate(&schema, &json!({"z": 123})).len(), 1);
-        assert!(validate(&schema, &json!({"z": "b"})).is_empty());
-    }
-
-    #[test]
-    fn pydantic_lax_coercible_values_pass() {
-        // RimCrow 同款 pydantic 2.12.5 实测：这些是服务端会接受的合法调用，不得误杀
+    fn ambiguous_union_objects_are_skipped() {
         let schema = json!({
             "type": "object",
             "properties": {
-                "limit": {"type": "integer"},
-                "offset": {"type": "integer"},
-                "ratio": {"type": "number"},
-                "dry_run": {"type": "boolean"}
+                "payload": {
+                    "anyOf": [
+                        {"type": "object", "additionalProperties": false,
+                         "properties": {"a": {"type": "string"}}},
+                        {"type": "object", "additionalProperties": false,
+                         "properties": {"b": {"type": "integer"}}}
+                    ]
+                }
             }
         });
-        let legal = json!({
-            "limit": "5",        // lax 把字符串当整数
-            "offset": true,      // lax 把 true 当 1
-            "ratio": 3.0,        // 整值浮点合法
-            "dry_run": "yes"     // lax 把 "yes" 当 true
-        });
-        assert!(
-            validate(&schema, &legal).is_empty(),
-            "legal coercions must pass"
-        );
-        // 服务端同样拒绝的取值（pydantic 2.12 实测：小数 3.5 与字符串 "maybe" 均报错）
-        let illegal = json!({"limit": 3.5, "dry_run": "maybe"});
-        let issues = validate(&schema, &illegal);
-        assert_eq!(issues.len(), 2, "{issues:?}");
-        assert!(issues.iter().all(|i| matches!(i, ArgIssue::Type { .. })));
+        // b 只属于第二支：不属于第一支也不是「未被识别」——交给服务端判
+        assert!(validate(&schema, &json!({"payload": {"b": 1}})).is_empty());
     }
 
     #[test]
@@ -639,63 +393,22 @@ mod tests {
     }
 
     #[test]
-    fn enum_violation_reported_and_compliant_passes() {
-        let schema = new_list_mods_schema();
-        assert!(validate(&schema, &json!({"scope": "active"})).is_empty());
-        let issues = validate(&schema, &json!({"scope": "Active"}));
-        assert_eq!(issues.len(), 1, "{issues:?}");
-        match &issues[0] {
-            ArgIssue::Enum {
-                path,
-                allowed,
-                actual,
-            } => {
-                assert_eq!(path, "scope");
-                assert_eq!(allowed, &["\"all\"", "\"active\"", "\"inactive\""]);
-                assert_eq!(actual, "\"Active\"");
-            }
-            other => panic!("expected Enum, got {other:?}"),
-        }
-        assert!(issues[0].describe().contains("\"Active\""));
-        // 数字按数值比：1.0 == 1
-        let schema = json!({"type": "object", "properties": {"n": {"enum": [1, 2]}}});
-        assert!(validate(&schema, &json!({"n": 1.0})).is_empty());
-        assert_eq!(validate(&schema, &json!({"n": 3})).len(), 1);
-        // 对象与数组取值的 enum 拿不准，放过
-        let schema = json!({"type": "object", "properties": {"o": {"enum": [{"a": 1}]}}});
-        assert!(validate(&schema, &json!({"o": {"b": 2}})).is_empty());
-    }
-
-    #[test]
-    fn type_array_and_unknown_keyword_do_not_flag() {
-        let schema = json!({"type": "object", "properties": {"t": {"type": ["string", "null"]}}});
-        assert!(validate(&schema, &json!({"t": null})).is_empty());
-        assert!(validate(&schema, &json!({"t": "x"})).is_empty());
-        assert_eq!(validate(&schema, &json!({"t": 5})).len(), 1);
-        // 未知类型关键字不判定
-        let schema = json!({"type": "object", "properties": {"u": {"type": "whatever"}}});
-        assert!(validate(&schema, &json!({"u": 5})).is_empty());
-    }
-
-    #[test]
-    fn describe_covers_every_issue_kind() {
-        let unknown = ArgIssue::Unknown {
+    fn describe_covers_nested_and_top_level() {
+        let nested = ArgIssue {
             path: "a.b".to_string(),
             known: vec!["x".to_string()],
         };
-        assert!(unknown.describe().contains("a.b"));
-        assert!(unknown.describe().contains("同层已知参数：x"));
-        let ty = ArgIssue::Type {
+        assert!(nested.describe().contains("a.b"));
+        assert!(nested.describe().contains("同层已知参数：x"));
+        let top = ArgIssue {
             path: "n".to_string(),
-            expected: "integer".to_string(),
-            actual: "string".to_string(),
+            known: vec![],
         };
-        assert!(ty.describe().contains("类型不符"));
-        let en = ArgIssue::Enum {
-            path: "s".to_string(),
-            allowed: vec!["\"a\"".to_string()],
-            actual: "\"b\"".to_string(),
+        assert!(top.describe().contains("n 未被识别"));
+        let nested_empty = ArgIssue {
+            path: "a[0].b".to_string(),
+            known: vec![],
         };
-        assert!(en.describe().contains("不在允许范围"));
+        assert!(nested_empty.describe().contains("该层未声明任何参数"));
     }
 }

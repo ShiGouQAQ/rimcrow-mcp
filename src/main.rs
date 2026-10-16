@@ -2,7 +2,7 @@
 //!
 //! 一个极薄的 **stdio ↔ Streamable HTTP 桥**：
 //! ```text
-//! MCP 客户端(ZCode/OpenCode) --stdio--> rimcrow-mcp.exe --Streamable HTTP--> RimCrow.exe 内嵌端点
+//! 任意 stdio MCP 客户端 --stdio--> rimcrow-mcp.exe --Streamable HTTP--> RimCrow.exe 内嵌端点
 //! ```
 //!
 //! CLI：`rimcrow-mcp.exe [--spawn] [--spawn-headless] [--version] [--help]`
