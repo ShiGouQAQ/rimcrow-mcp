@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "rimcrow_version": "0.24.12",
-  "captured_at": "2026-10-15T16:20:21.540042+00:00",
+  "captured_at": "2026-10-19T10:56:53.489322+00:00",
   "server_name": "rimcrow-mcp",
   "instructions": "RimCrow（RimWorld 模组管理器）的 MCP 接口。工具按风险标注只读/写入/高风险（对应 MCP ToolAnnotations 的 readOnlyHint / destructiveHint）。使用约定：\n1. 分页取数——list_mods / get_load_order / read_logs 用 limit+offset（或 filter/keyword）限定范围，避免一次取回全部；响应里 next_offset 非 null 表示还有下一页。\n2. 增量修改——加载顺序一律用 apply_load_order_ops 提交 ops，先 dry_run:true 校验再正式写入；不要「读全量→改→回传全量」。\n3. 并发控制——写入必须带上最近一次响应的 version_token / new_version_token（乐观锁）；不一致会返回冲突，此时重新 get_load_order 取新 token 后重试。\n4. 返回摘要——日志按 list_log_files → read_logs（levels 过滤、tail 取最新）→ get_log_context 逐层缩小范围，不要回传整份文件。\n5. 按固定流程组合——获取依赖：resolve_missing_dependencies → download_workshop_mods → wait_event(\"scan-complete\") → list_mods；Git 仓库：github_fetch_repo_info → github_subscribe_repo → github_get_timeline 跟踪部署；排障：search_mod_text 检索模组文件，launch_game 后用 get_game_status / wait_event(\"game-status-changed\") 跟踪再 read_logs 验证；导入排序：parse_load_order 解析 → apply_load_order_ops 写入；贴图转换：get_texture_encoder_status → download_texture_encoder（缺 bin 时）→ start_texture_convert（先 dry_run:true 预演）→ get_texture_convert_tasks 轮询。\nscan_mods、下载等异步操作完成后用 wait_event 等待，或轮询 list_mods / get_download_tasks 确认。",
   "tools": [
@@ -430,7 +430,7 @@
     },
     {
       "name": "save_load_order",
-      "description": "[写] 把激活列表全量写入 ModsConfig.xml，带 version_token 冲突检测。\nactive_ids 必须是完整目标列表；base_version_token 在 schema 中可选但必须传，\n否则跳过冲突检测，可能覆盖其它程序对该文件的改动。\n（MCP 扩展）⚠ 全量返回、体积大，仅作兼容保留——顺序调整改用\napply_load_order_ops(增量操作、原子提交、支持 dry_run)。",
+      "description": "[写] 把激活列表全量写入 ModsConfig.xml，带 version_token 冲突检测。\nactive_ids 必须是完整目标列表；base_version_token 在 schema 中可选但必须传，\n否则跳过冲突检测，可能覆盖其它程序对该文件的改动。\n写入不校验模组存在性：未安装/已物理禁用的条目会照常写进加载表(游戏加载不到)，\n成功响应 missing 列出这类条目；导入第三方清单前建议先用 parse_load_order 查看缺失报告。\n（MCP 扩展）⚠ 全量返回、体积大，仅作兼容保留——顺序调整改用\napply_load_order_ops(增量操作、原子提交、支持 dry_run)。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -970,7 +970,7 @@
     },
     {
       "name": "apply_load_order_ops",
-      "description": "[写] 用增量操作原子地修改加载顺序（顺序变更的推荐入口）。\nops 整批全有全无、最多 100 条：insert{id,anchor:{after|before|index}}｜remove{ids}｜\nmove{id,to:{index|after|before}}｜activate{ids}｜deactivate{ids}。\nbase_version_token 取自 get_load_order(用于冲突检测)；dry_run:true 只校验、不写入，\n也不会返回 new_version_token。写入成功返回 summary/conflicts/new_version_token，\n不返回完整列表。",
+      "description": "[写] 用增量操作原子地修改加载顺序（顺序变更的推荐入口）。\nops 整批全有全无、最多 100 条：insert{id,anchor:{after|before|index}}｜remove{ids}｜\nmove{id,to:{index|after|before}}｜activate{ids}｜deactivate{ids}。\nbase_version_token 取自 get_load_order(用于冲突检测)；dry_run:true 只校验、不写入，\n也不会返回 new_version_token。写入成功返回 summary/conflicts/new_version_token，\n不返回完整列表。\n响应 missing 列出最终列表中当前环境不可见(未安装或已物理禁用)的条目——这类 id\n会照常写入 ModsConfig.xml 但游戏加载不到，仅提示、不阻断；dry_run 响应同样携带。",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -1261,6 +1261,37 @@
       "annotations": {
         "readOnlyHint": false,
         "destructiveHint": false
+      }
+    },
+    {
+      "name": "mods_physical_disable",
+      "description": "[高风险] 物理禁用/恢复模组：把模组目录内 About.xml 改名为 About.xml.disabled\n(disabled:false 反向还原)，数据库标记同步更新。与 apply_load_order_ops 的\nactivate/deactivate 完全不同：那组只增删加载表条目，本工具直接触碰模组文件，\n模组会从「当前环境可见模组」中消失(list_mods 不再返回)，加载表不受影响。\npackage_ids 按当前档案可见模组解析(大小写不敏感)，未安装或不可见的 id 整批拒绝；\n已处于目标状态的模组跳过、不触碰磁盘；同一 id 的多个可见副本会逐个执行，\n同一物理文件的第二次改名命中幂等分支不会重复改名。工坊模组改名可能被 Steam\n校验还原，慎用；改名直接发生在模组目录内，本工具不产生备份。\ndry_run:true 只返回解析与分类结果、不写任何文件。成功后建议 scan_mods 刷新索引\n与部署联接。",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "package_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "disabled": {
+            "default": true,
+            "type": "boolean"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "package_ids"
+        ],
+        "type": "object"
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true
       }
     },
     {
